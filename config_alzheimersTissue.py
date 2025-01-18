@@ -1,0 +1,58 @@
+config = {
+    "file_keywords": {
+        "magnification_keyword": "100X",
+        "fluorescence_markers": ["DAPI", "IBA1", "GFAP"],
+        "cars_keyword": "CARS2850",
+        "stacks_keywords": ["Microglia", "Astrocytes"],
+        "hyperspectral_keyword": "Spectrum"
+    },
+    "channel_map": {
+        "DAPI": 0,
+        "IBA1": 1,
+        "Autofluorescence": 2,
+        "GFAP": 3
+    },
+    "cell_markers": ["IBA1", "GFAP"],
+    "morphology_params": {
+        "fluorescence_params": {
+            "min_size": 10000,
+            "closing_radius": 10,
+            "gaussian_sigma": 3,
+            "fill_holes": True
+        },
+        "nuclei_params": {
+            "min_size": 5000,
+            "closing_radius": 10,
+            "gaussian_sigma": 3,
+            "fill_holes": True
+        },
+        "foci_params": {
+            "sigma": 2,
+            "min_distance": 15,
+            "min_size": 35,
+            "std_dev_multiplier": 3
+        }
+    },
+    "colormaps": {
+        "DAPI": (0, 0, 255),  # blue
+        "IBA1": (0, 255, 0),  # green
+        "Autofluorescence": (255, 0, 0),  # red
+        "GFAP": (255, 0, 255),  # magenta
+        "DEFAULT": (255, 255, 255)  # fallback color (white)
+    },
+    "paths": {
+        "data_directory": r"C:\Users\clchr\Downloads\AD3c",
+    },
+    "stack_offset": {
+        "DAPI": 0,
+        "IBA1": 0,
+        "GFAP": 0
+    },
+    "cell_marker_map": {
+        # The key should match the *label* after "Stacks"
+        # e.g. if you have "StacksMicroglia" => label is "Microglia".
+        # So "Microglia" => ["IBA1"], "Astrocytes" => ["GFAP"]
+        "Microglia": ["IBA1"],
+        "Astrocytes": ["GFAP"]
+    }
+}
