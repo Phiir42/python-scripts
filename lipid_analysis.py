@@ -68,6 +68,7 @@ import os
 import re
 
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -77,7 +78,7 @@ from PIL import Image
 from scipy import ndimage as ndi
 from skimage import feature, measure, segmentation
 from skimage.exposure import rescale_intensity
-from skimage.filters import gaussian, threshold_otsu
+from skimage.filters import gaussian, threshold_otsu, threshold_li, threshold_triangle, threshold_yen
 from skimage.morphology import closing, disk, opening, remove_small_objects
 from skimage.segmentation import find_boundaries
 from tifffile import imwrite
@@ -285,7 +286,8 @@ def create_custom_colormap(start_color, end_color):
 
 
 def process_fluorescence_channel(image_slice, min_size,
-                                 closing_radius, gaussian_sigma, fill_holes):
+                                 closing_radius, gaussian_sigma, fill_holes,
+                                 threshold_method="otsu", offset=1.0):
     """
     Process a single fluorescence image slice and create a binary mask.
 
@@ -323,9 +325,22 @@ def process_fluorescence_channel(image_slice, min_size,
 
     image_slice = np.nan_to_num(image_slice)
     smoothed_image = gaussian(image_slice, sigma=gaussian_sigma, preserve_range=True)
-    threshold_value = threshold_otsu(smoothed_image)
-    binary_mask = smoothed_image > threshold_value
-
+    
+    # Pick which threshold function to call
+    if threshold_method.lower() == "otsu":
+        base_threshold = threshold_otsu(smoothed_image)
+    elif threshold_method.lower() == "li":
+        base_threshold = threshold_li(smoothed_image)
+    elif threshold_method.lower() == "triangle":
+        base_threshold = threshold_triangle(smoothed_image)
+    elif threshold_method.lower() == "yen":
+        base_threshold = threshold_yen(smoothed_image)
+    else:
+        # fallback
+        base_threshold = threshold_otsu(smoothed_image)
+    
+    final_threshold = base_threshold * offset
+    binary_mask = smoothed_image > final_threshold
     binary_closed = closing(binary_mask, disk(closing_radius))
     if fill_holes:
         binary_closed = ndi.binary_fill_holes(binary_closed)
@@ -885,6 +900,9 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
         for pos in range(fluoro_nd2.sizes['v']):
             fluoro_nd2.default_coords['v'] = pos
             cars_nd2.default_coords['v'] = pos
+            
+            file_stub = os.path.splitext(os.path.basename(fluorescence_path))[0]
+            file_stub += f"_pos{pos+1}"
 
             # 1) Attempt to read the DAPI channel
             dapi_ch_idx = config["channel_map"].get("DAPI", None)
@@ -993,10 +1011,12 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
                     # NEW: If DAPI is present, save transparent overlay
                     if dapi_mask is not None:
+                        images_dir = ensure_subdirectory(config["paths"]["data_directory"], "Images")
+                        
+                        # Use file_stub so each overlay gets the correct prefix (e.g., AD44-S1159_pos2)
                         out_overlay_path = os.path.join(
-                            config["paths"]["data_directory"],
-                            "Images",
-                            f"DAPI_{cm}_pos{pos+1}.png"
+                            images_dir,
+                            f"{file_stub}_DAPI_{cm}.png"
                         )
                         # Pass the marker name so we can retrieve the color from config
                         save_dapi_marker_overlay(
@@ -1019,9 +1039,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     z_stack_fl.append(raw_slice_fluor)
                 marker_max = np.max(np.array(z_stack_fl), axis=0)
                 fluor_images_for_composite[marker_name] = marker_max
-
-            file_stub = os.path.splitext(os.path.basename(fluorescence_path))[0]
-            file_stub += f"_pos{pos+1}"
 
             save_composite_images(
                 fluor_images_for_composite,

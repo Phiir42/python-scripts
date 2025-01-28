@@ -24,7 +24,9 @@ config = {
             "min_size": 5000,
             "closing_radius": 10,
             "gaussian_sigma": 3,
-            "fill_holes": True
+            "fill_holes": True,
+            "threshold_method": "triangle",
+            "offset": 1.05
         },
         "foci_params": {
             "sigma": 2,
