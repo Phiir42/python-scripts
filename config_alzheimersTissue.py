@@ -13,12 +13,24 @@ config = {
         "GFAP": 3
     },
     "cell_markers": ["IBA1", "GFAP"],
+    "marker_thresholds": {
+        "IBA1": {
+            "threshold_method": "triangle",
+            "offset": 0.9
+        },
+        "GFAP": {
+            "threshold_method": "triangle",
+            "offset": 0.9
+        }
+    },
     "morphology_params": {
         "fluorescence_params": {
             "min_size": 10000,
             "closing_radius": 10,
             "gaussian_sigma": 3,
-            "fill_holes": True
+            "fill_holes": True,
+            "threshold_method": "otsu",  # fallback
+            "offset": 1.0               # fallback
         },
         "nuclei_params": {
             "min_size": 5000,
@@ -29,6 +41,12 @@ config = {
             "offset": 1.05
         },
         "foci_params": {
+            "sigma": 2,
+            "min_distance": 15,
+            "min_size": 35,
+            "std_dev_multiplier": 3
+        },
+        "foci_params_hyperspectral": {
             "sigma": 2,
             "min_distance": 15,
             "min_size": 35,

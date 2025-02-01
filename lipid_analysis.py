@@ -145,40 +145,181 @@ def find_nd2_files(directory):
     ValueError
         If no valid 'StacksX' substring is found when parsing certain filenames.
     """
-    fluorescence_files = {}
-    cars_files = {}
     hyperspectral_folders = []
+    cars_list = []
+    fluorescence_list = []
 
-    hyperspectral_keyword = config["file_keywords"]["hyperspectral_keyword"]
+    file_kw = config["file_keywords"]
+    mag_kw = file_kw["magnification_keyword"]
+    hyperspec_kw = file_kw["hyperspectral_keyword"]
 
-    for file in os.listdir(directory):
-        full_path = os.path.join(directory, file)
+    for item in os.listdir(directory):
+        full_path = os.path.join(directory, item)
 
-        # Identify hyperspectral folders
-        if hyperspectral_keyword in file and os.path.isdir(full_path):
+        # 1) If it's a folder with hyperspec keyword, store it
+        if os.path.isdir(full_path) and hyperspec_kw in item:
             hyperspectral_folders.append(full_path)
+            continue
 
-        # Only process .nd2 files that contain the desired magnification keyword
-        if (file.endswith('.nd2')
-                and config["file_keywords"]["magnification_keyword"] in file):
-            key = get_file_key(file)
+        # 2) If it's not an ND2 or doesn't contain the magnification, skip
+        if not (item.endswith(".nd2") and mag_kw in item):
+            continue
 
-            if config["file_keywords"]["cars_keyword"] in file:
-                cars_files[key] = full_path
-            elif any(marker in file
-                     for marker in config["file_keywords"]["fluorescence_markers"]):
-                fluorescence_files[key] = full_path
+        # 3) Parse it
+        meta = parse_nd2_filename(item, config)
+        print(f"File: {item} => meta: {meta}")
+        if meta["contains_cars"]:
+            cars_list.append((meta, full_path))
+        else:
+            # It's presumably a fluorescence .nd2
+            # But we might confirm by checking if meta["markers_found"] is non-empty, etc.
+            fluorescence_list.append((meta, full_path))
 
-    # Now pair them up
-    paired_files = {}
-    for key, fluoro_path in fluorescence_files.items():
-        if key in cars_files:
-            paired_files[key] = {
-                'fluorescence': fluoro_path,
-                'CARS': cars_files[key]
-            }
-
+    # Now we want to pair them up
+    paired_files = match_fluoro_and_cars(fluorescence_list, cars_list, config)
     return paired_files, hyperspectral_folders
+
+
+def match_fluoro_and_cars(fluoro_list, cars_list, config):
+    """
+    Attempt to pair each fluorescence file with a corresponding CARS file
+    based on:
+      - same prefix
+      - same stacks_label, stacks_number
+      - (optional) marker overlap
+    Returns a dict: { "someKey": {"fluorescence": path, "CARS": path}, ... }
+    """
+    paired_files = {}
+
+    # If you need offsets, store them from config
+    stack_offset_dict = config.get("stack_offset", {})
+
+    for (f_meta, f_path) in fluoro_list:
+        # 1) Possibly adjust f_meta["stacks_number"] if offset needed
+        # If ANY marker in f_meta["markers_found"] -> sum offsets
+        offset_total = 0
+        for mk in f_meta["markers_found"]:
+            offset_total += stack_offset_dict.get(mk, 0)
+        f_stacks_num = None
+        if f_meta["stacks_number"] is not None:
+            f_stacks_num = f_meta["stacks_number"] + offset_total
+
+        # We'll build an internal key to identify the "fluoro side" 
+        # ignoring the markers in the name, we unify by prefix + stacks_label + corrected number
+        for (c_meta, c_path) in cars_list:
+            # Check prefix
+            if f_meta["prefix"] != c_meta["prefix"]:
+                continue
+            # Check stacks_label
+            if f_meta["stacks_label"] != c_meta["stacks_label"]:
+                continue
+            # Check stacks_number
+            c_stacks_num = c_meta["stacks_number"]
+            if f_stacks_num != c_stacks_num:
+                continue
+
+            # "marker overlap" is optional; only enforced if CARS has markers
+            c_cars_markers = c_meta["markers_found"]
+            if c_cars_markers:  # if not empty
+                # Then require that these markers also appear in the fluorescence file
+                if not c_cars_markers.issubset(f_meta["markers_found"]):
+                    continue
+
+            # If we pass all checks, we have a match
+            pair_key = f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}{f_stacks_num or ''}"
+            c_markers_sorted = "-".join(sorted(list(c_cars_markers))) or "NoMarkers"
+            pair_key = f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}{f_stacks_num or ''}-{c_markers_sorted}"
+            paired_files[pair_key] = {
+                "fluorescence": f_path,
+                "CARS": c_path
+            }
+            # We can break here if we assume 1:1 matching
+            break
+
+    return paired_files
+
+
+def parse_nd2_filename(filename, config):
+    """
+    Parse a filename like:
+      "AD44-S1159-CARS2850-TUJ_Ck-100X-StacksNeurons3.nd2"
+
+    Returns a dict with fields:
+      {
+        "base_no_ext": "AD44-S1159-CARS2850-TUJ_Ck-100X-StacksNeurons3",
+        "prefix": "AD44-S1159",  # everything before the first recognized marker/cars/magnification
+        "markers_found": set(),  # e.g. {"TUJ_Ck"} if that substring is present
+        "contains_cars": bool,   # True if "CARS2850" found
+        "magnification": "100X" or None
+        "stacks_label": "Neurons"  (the word after "Stacks")
+        "stacks_number": 3 or None
+      }
+    """
+    base_no_ext = filename.replace(".nd2", "")
+
+    # 1) Identify if it contains the cars_keyword
+    cars_keyword = config["file_keywords"]["cars_keyword"]
+    contains_cars = (cars_keyword in base_no_ext)
+
+    # 2) Identify magnification keyword if present
+    mag_keyword = config["file_keywords"]["magnification_keyword"]
+    magnification = mag_keyword if (mag_keyword in base_no_ext) else None
+
+    # 3) Find all fluorescence markers that appear in the filename
+    found_markers = set()
+    for mk in config["file_keywords"]["fluorescence_markers"]:
+        if mk in base_no_ext:
+            found_markers.add(mk)
+
+    # 4) Locate "Stacks..." substring at the end of the filename
+    #    e.g. "StacksNeurons3" => label="Neurons", number=3
+    match = re.search(r"(Stacks([A-Za-z]*)(\d*)$)", base_no_ext)
+    stacks_label = None
+    stacks_number = None
+    if match:
+        # full_stacks_str = match.group(1)  # "StacksNeurons3"
+        label_part = match.group(2)       # "Neurons"
+        digit_part = match.group(3)       # "3" or ""
+        stacks_label = label_part
+        if digit_part:
+            stacks_number = int(digit_part)
+
+    # 5) Build the "prefix"
+    #    Everything before the "Stacks..." portion, but we also want
+    #    to systematically remove the known magnification, the "CARS2850"
+    #    if present, and the recognized markers from the end, so we can
+    #    get something stable like "AD44-S1159" 
+    prefix_candidate = base_no_ext
+    if match:
+        # remove the matched "StacksNeurons3" from the end
+        prefix_candidate = prefix_candidate[: match.start(1)]
+
+    # remove magnification
+    if magnification is not None:
+        prefix_candidate = prefix_candidate.replace(mag_keyword, "")
+    # remove the cars keyword
+    if contains_cars:
+        prefix_candidate = prefix_candidate.replace(cars_keyword, "")
+
+    # remove all found markers
+    for mk in found_markers:
+        prefix_candidate = prefix_candidate.replace(mk, "")
+
+    # Now remove trailing dashes or underscores
+    prefix_candidate = re.sub(r"[-_]+$", "", prefix_candidate)
+    prefix_candidate = prefix_candidate.strip()
+
+    # Build result
+    meta = {
+        "base_no_ext": base_no_ext,
+        "prefix": prefix_candidate,   # e.g. "AD44-S1159"
+        "markers_found": found_markers,
+        "contains_cars": contains_cars,
+        "magnification": magnification,
+        "stacks_label": stacks_label,
+        "stacks_number": stacks_number
+    }
+    return meta
 
 
 def get_file_key(filename):
@@ -287,7 +428,10 @@ def create_custom_colormap(start_color, end_color):
 
 def process_fluorescence_channel(image_slice, min_size,
                                  closing_radius, gaussian_sigma, fill_holes,
-                                 threshold_method="otsu", offset=1.0):
+                                 threshold_method, offset,
+                                 exclude_dark_regions=True,
+                                 dark_threshold=50,
+                                 min_hole_size=20000):
     """
     Process a single fluorescence image slice and create a binary mask.
 
@@ -326,18 +470,41 @@ def process_fluorescence_channel(image_slice, min_size,
     image_slice = np.nan_to_num(image_slice)
     smoothed_image = gaussian(image_slice, sigma=gaussian_sigma, preserve_range=True)
     
+    # (Optional) Exclude large dark holes from threshold
+    if exclude_dark_regions:
+        # Create a preliminary mask for very dark pixels
+        preliminary_dark_mask = smoothed_image < dark_threshold
+
+        # Label connected regions in that dark mask
+        labeled_dark = measure.label(preliminary_dark_mask)
+        props = measure.regionprops(labeled_dark)
+
+        # Build a final 'exclude_mask' for large holes
+        exclude_mask = np.zeros_like(labeled_dark, dtype=bool)
+        for region in props:
+            if region.area >= min_hole_size:
+                # Mark all pixels in that region as exclude
+                coords = region.coords
+                exclude_mask[coords[:, 0], coords[:, 1]] = True
+
+        # We'll only use the pixels that are NOT excluded when computing threshold
+        valid_pixels = smoothed_image[~exclude_mask].ravel()
+    else:
+        exclude_mask = np.zeros_like(smoothed_image, dtype=bool)
+        valid_pixels = smoothed_image.ravel()
+    
     # Pick which threshold function to call
     if threshold_method.lower() == "otsu":
-        base_threshold = threshold_otsu(smoothed_image)
+        base_threshold = threshold_otsu(valid_pixels)
     elif threshold_method.lower() == "li":
-        base_threshold = threshold_li(smoothed_image)
+        base_threshold = threshold_li(valid_pixels)
     elif threshold_method.lower() == "triangle":
-        base_threshold = threshold_triangle(smoothed_image)
+        base_threshold = threshold_triangle(valid_pixels)
     elif threshold_method.lower() == "yen":
-        base_threshold = threshold_yen(smoothed_image)
+        base_threshold = threshold_yen(valid_pixels)
     else:
         # fallback
-        base_threshold = threshold_otsu(smoothed_image)
+        base_threshold = threshold_otsu(valid_pixels)
     
     final_threshold = base_threshold * offset
     binary_mask = smoothed_image > final_threshold
@@ -384,9 +551,13 @@ def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
     data_dict['smoothed'] = gaussian(image_slice, sigma=sigma, preserve_range=True)
 
     # 2) Thresholds
-    mean_val = np.mean(data_dict['smoothed'])
-    std_val = np.std(data_dict['smoothed'])
-    threshold_val = mean_val + (std_dev_multiplier * std_val)
+    pixel_vals = data_dict['smoothed'].ravel()
+    median_val = np.median(pixel_vals)
+    mad_val = robust_mad(pixel_vals)
+    
+    # For normal data, std ~ 1.4826 * MAD
+    approx_std = 1.4826 * mad_val
+    threshold_val = median_val + (std_dev_multiplier * approx_std)
     data_dict['mask_std'] = data_dict['smoothed'] > threshold_val
 
     global_thresh = threshold_otsu(data_dict['smoothed'])
@@ -416,6 +587,15 @@ def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
             final_mask[tuple(region.coords.T)] = True
 
     return final_mask
+
+
+def robust_mad(a):
+    """
+    Simple helper to compute median absolute deviation.
+    Returns median(|x - median(x)|).
+    """
+    med = np.median(a)
+    return np.median(np.abs(a - med))
 
 
 def process_hyperspectral_series(spectrum_folder, reference_image, output_path, foci_params):
@@ -833,7 +1013,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
     all_positions_summary : list of dict
         Summary of lipid objects per cell from each marker.
     """
-    fluorescence_params = config["morphology_params"]["fluorescence_params"]
     foci_params = config["morphology_params"]["foci_params"]
 
     # Identify which marker is in this filename (for analysis display)
@@ -848,10 +1027,15 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
         return [], []
 
     channel_map = config["channel_map"]
-    analysis_channel_index = channel_map.get(analysis_marker_hit, 0)
 
-    file_key = get_file_key(os.path.basename(fluorescence_path))
-    match_stacks = re.search(r"Stacks([A-Za-z]+)", file_key)  # ignoring digits
+    # Try to parse "Stacks..." from the filename with get_file_key, but if it fails or not found,
+    # we won't raise an error. We'll just set stacks_label = ""
+    try:
+        file_key = get_file_key(os.path.basename(fluorescence_path))
+    except ValueError:
+        file_key = os.path.basename(fluorescence_path)
+
+    match_stacks = re.search(r"Stacks([A-Za-z]+)", file_key)
     if match_stacks:
         stacks_label = match_stacks.group(1)
     else:
@@ -926,21 +1110,39 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             # 2) Read & correct the CARS channel
             cars_slice = max_project_cars(cars_nd2, 2, pos)
             corrected_cars_slice = np.nan_to_num(cars_slice / reference_image)
+            
+            # Gather multiple fluorescence images into a composite
+            
+            fluor_images_for_display = {}
+            
+            for cm in chosen_cell_markers:
+                if cm in fluorescence_path:
+                    ch_idx = channel_map.get(cm, None)
+                    if ch_idx is not None:
+                        # Max-project that channel
+                        z_stack_fl = []
+                        for z_idx in range(fluoro_nd2.sizes['z']):
+                            raw_slice = np.nan_to_num(fluoro_nd2.get_frame_2D(v=pos, c=ch_idx, z=z_idx))
+                            z_stack_fl.append(raw_slice)
+                        fluor_images_for_display[cm] = np.max(np.array(z_stack_fl), axis=0)
+                    
+            # Build a color composite from those channels
+            if len(fluor_images_for_display) > 0:
+                composite_fluor = composite_fluorescence(fluor_images_for_display, config)
+            else:
+                # If somehow none are present, fall back to an empty or single-channel image
+                composite_fluor = np.zeros((corrected_cars_slice.shape[0], corrected_cars_slice.shape[1], 3), dtype=np.uint8)
 
             # Display the main analysis marker + the CARS
-            fluorescence_slice = max_project_channel(fluoro_nd2,
-                                                     analysis_channel_index,
-                                                     pos)
-            marker_colormap = get_marker_color(analysis_marker_hit,
-                                               config["colormaps"])
             fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-            axs[0].imshow(fluorescence_slice, cmap=marker_colormap)
-            axs[0].set_title(f"Max Projected Fluorescence (pos={pos+1})")
+            axs[0].imshow(composite_fluor)
+            axs[0].set_title(f"Max Projected Fluorescence Overlay (pos={pos+1})")
             axs[0].axis('off')
-
+            
             axs[1].imshow(corrected_cars_slice, cmap='gray')
             axs[1].set_title(f"Max Projected CARS (pos={pos+1})")
             axs[1].axis('off')
+            
             plt.show()
 
             # 3) Identify lipid droplets
@@ -954,8 +1156,33 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         continue
                     cm_slice = max_project_channel(fluoro_nd2,
                                                    cm_channel_idx, pos)
+                    
+                    # 1) Pull global fluorescence params
+                    base_fluor_params = config["morphology_params"]["fluorescence_params"]
+
+                    # 2) Get marker-specific threshold settings if present
+                    marker_thresholds = config.get("marker_thresholds", {})
+                    cm_thresholds = marker_thresholds.get(cm, {})
+
+                    # 3) Decide final threshold method & offset
+                    threshold_method = cm_thresholds.get(
+                        "threshold_method",
+                        base_fluor_params.get("threshold_method", "otsu")
+                    )
+                    offset_val = cm_thresholds.get(
+                        "offset",
+                        base_fluor_params.get("offset", 1.0)
+                    )
+                    
+                    # 4) Now call process_fluorescence_channel
                     cm_mask = process_fluorescence_channel(
-                        cm_slice, **fluorescence_params
+                        cm_slice,
+                        min_size=base_fluor_params["min_size"],
+                        closing_radius=base_fluor_params["closing_radius"],
+                        gaussian_sigma=base_fluor_params["gaussian_sigma"],
+                        fill_holes=base_fluor_params["fill_holes"],
+                        threshold_method=threshold_method,
+                        offset=offset_val
                     )
 
                     pos_results, pos_summary = analyze_intracellular_objects(
@@ -1334,7 +1561,10 @@ if __name__ == "__main__":
         all_summary_list.extend(pair_sum)
 
     # 3) Process hyperspectral series
-    foci_params_dict = config["morphology_params"]["foci_params"]
+    hyperspectral_foci_params = config["morphology_params"].get(
+        "foci_params_hyperspectral",
+        config["morphology_params"]["foci_params"]  # fallback if not defined
+    )
     for folder in hyperspectral_folders:
         folder_name = os.path.basename(folder)
         hyperspectral_output = os.path.join(
@@ -1345,7 +1575,7 @@ if __name__ == "__main__":
             folder,
             reference_image,
             hyperspectral_output,
-            foci_params_dict
+            hyperspectral_foci_params
         )
 
     # 4) Save results to Excel
