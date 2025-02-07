@@ -3,7 +3,8 @@
 """
 lipid_analysis.py
 
-This module provides a workflow for analyzing lipid inclusions in microscopy images using:
+This module provides a workflow for analyzing lipid inclusions in microscopy images
+using:
 1) Fluorescence .nd2 files
 2) CARS (Coherent Anti-Stokes Raman Scattering) .nd2 files
 3) Optional hyperspectral series folders
@@ -14,30 +15,32 @@ Main steps:
    - A reference ND2 file is opened and used to create a normalized reference TIFF.
 
 2. File pairing and offset logic:
-   - The script identifies fluorescence vs. CARS .nd2 files (based on config-defined keywords).
-   - Each file is given a "StacksX" key, with optional marker-based offsets for fluorescence,
-     ensuring correct pairing with corresponding CARS images.
+   - The script identifies fluorescence vs. CARS .nd2 files (based on config-defined
+     keywords).
+   - Each file is given a "StacksX" key, with optional marker-based offsets for
+     fluorescence, ensuring correct pairing with corresponding CARS images.
 
 3. Image processing:
    - Fluorescence images are processed to generate a binary cell mask.
    - CARS images are processed to identify lipid droplets (foci).
-   - The pipeline performs measurements of lipid inclusions (size, intensity) within each cell.
+   - The pipeline performs measurements of lipid inclusions (size, intensity) within
+     each cell.
 
 4. Hyperspectral analysis (if applicable):
-   - Folders containing hyperspectral data are detected, and each ND2 in the folder is processed
-     to build a series of corrected images and measure lipid intensities across different
-     wavenumbers.
+   - Folders containing hyperspectral data are detected, and each ND2 in the folder is
+     processed to build a series of corrected images and measure lipid intensities
+     across different wavenumbers.
 
 5. Results output:
-   - The script saves a final Excel file containing detailed measurements for each cell (lipid
-     objects, intensities) and a summary table.
+   - The script saves a final Excel file containing detailed measurements for each
+     cell (lipid objects, intensities) and a summary table.
 
 Usage:
 ------
-Execute lipid_analysis.py from within an environment where `nd2reader`, `scipy`, `pandas`,
-`skimage`, and other dependencies are installed. The script reads paths and parameters from a
-configuration file (e.g., `config_ovarianTissue.py`), allowing easy adaptation for different tissue
-types or markers.
+Execute lipid_analysis.py from within an environment where `nd2reader`, `scipy`,
+`pandas`, `skimage`, and other dependencies are installed. The script reads paths
+and parameters from a configuration file (e.g., `config_ovarianTissue.py`),
+allowing easy adaptation for different tissue types or markers.
 
 Example:
 --------
@@ -57,16 +60,15 @@ Dependencies:
 
 Note:
 -----
-The script assumes that all relevant .nd2 files follow a naming convention containing the substring
-"StacksX" and a magnification keyword like "100X". The config file governs how marker offsets
-are applied, and how hyperspectral data is processed. Adjust the config file as needed for
-other tissue systems or filename patterns.
+The script assumes that all relevant .nd2 files follow a naming convention containing
+the substring "StacksX" and a magnification keyword like "100X". The config file
+governs how marker offsets are applied, and how hyperspectral data is processed.
+Adjust the config file as needed for other tissue systems or filename patterns.
 """
 
 import logging
 import os
 import re
-
 
 import cv2
 import matplotlib.pyplot as plt
@@ -78,7 +80,9 @@ from PIL import Image
 from scipy import ndimage as ndi
 from skimage import feature, measure, segmentation
 from skimage.exposure import rescale_intensity
-from skimage.filters import gaussian, threshold_otsu, threshold_li, threshold_triangle, threshold_yen
+from skimage.filters import (
+    gaussian, threshold_otsu, threshold_li, threshold_triangle, threshold_yen
+)
 from skimage.morphology import closing, disk, opening, remove_small_objects
 from skimage.segmentation import find_boundaries
 from tifffile import imwrite
@@ -88,11 +92,13 @@ from config_alzheimersTissue import config
 # Suppress excessive logs from nd2reader
 logging.getLogger('nd2reader').setLevel(logging.ERROR)
 
-EAST_SHADOWS_KERNEL = np.array([
-    [-1,  0,  1],
-    [-2,  1,  2],
-    [-1,  0,  1]
-], dtype=np.float32)
+EAST_SHADOWS_KERNEL = np.array(
+    [
+        [-1, 0, 1],
+        [-2, 1, 2],
+        [-1, 0, 1]
+    ], dtype=np.float32
+)
 
 
 def apply_east_shadows_filter(image):
@@ -187,6 +193,7 @@ def match_fluoro_and_cars(fluoro_list, cars_list, config):
       - same prefix
       - same stacks_label, stacks_number
       - (optional) marker overlap
+
     Returns a dict: { "someKey": {"fluorescence": path, "CARS": path}, ... }
     """
     paired_files = {}
@@ -204,8 +211,9 @@ def match_fluoro_and_cars(fluoro_list, cars_list, config):
         if f_meta["stacks_number"] is not None:
             f_stacks_num = f_meta["stacks_number"] + offset_total
 
-        # We'll build an internal key to identify the "fluoro side" 
-        # ignoring the markers in the name, we unify by prefix + stacks_label + corrected number
+        # We'll build an internal key to identify the "fluoro side"
+        # ignoring the markers in the name, we unify by prefix + stacks_label
+        # + corrected number
         for (c_meta, c_path) in cars_list:
             # Check prefix
             if f_meta["prefix"] != c_meta["prefix"]:
@@ -221,14 +229,20 @@ def match_fluoro_and_cars(fluoro_list, cars_list, config):
             # "marker overlap" is optional; only enforced if CARS has markers
             c_cars_markers = c_meta["markers_found"]
             if c_cars_markers:  # if not empty
-                # Then require that these markers also appear in the fluorescence file
+                # Then require that these markers also appear in the fluoro file
                 if not c_cars_markers.issubset(f_meta["markers_found"]):
                     continue
 
             # If we pass all checks, we have a match
-            pair_key = f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}{f_stacks_num or ''}"
+            pair_key = (
+                f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}"
+                f"{f_stacks_num or ''}"
+            )
             c_markers_sorted = "-".join(sorted(list(c_cars_markers))) or "NoMarkers"
-            pair_key = f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}{f_stacks_num or ''}-{c_markers_sorted}"
+            pair_key = (
+                f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}"
+                f"{f_stacks_num or ''}-{c_markers_sorted}"
+            )
             paired_files[pair_key] = {
                 "fluorescence": f_path,
                 "CARS": c_path
@@ -247,11 +261,11 @@ def parse_nd2_filename(filename, config):
     Returns a dict with fields:
       {
         "base_no_ext": "AD44-S1159-CARS2850-TUJ_Ck-100X-StacksNeurons3",
-        "prefix": "AD44-S1159",  # everything before the first recognized marker/cars/magnification
+        "prefix": "AD44-S1159",
         "markers_found": set(),  # e.g. {"TUJ_Ck"} if that substring is present
         "contains_cars": bool,   # True if "CARS2850" found
         "magnification": "100X" or None
-        "stacks_label": "Neurons"  (the word after "Stacks")
+        "stacks_label": "Neurons",  # the word after "Stacks"
         "stacks_number": 3 or None
       }
     """
@@ -277,42 +291,33 @@ def parse_nd2_filename(filename, config):
     stacks_label = None
     stacks_number = None
     if match:
-        # full_stacks_str = match.group(1)  # "StacksNeurons3"
-        label_part = match.group(2)       # "Neurons"
-        digit_part = match.group(3)       # "3" or ""
+        label_part = match.group(2)
+        digit_part = match.group(3)
         stacks_label = label_part
         if digit_part:
             stacks_number = int(digit_part)
 
     # 5) Build the "prefix"
-    #    Everything before the "Stacks..." portion, but we also want
-    #    to systematically remove the known magnification, the "CARS2850"
-    #    if present, and the recognized markers from the end, so we can
-    #    get something stable like "AD44-S1159" 
+    #    Everything before the "Stacks..." portion, plus removing known magnification,
+    #    cars keyword, and recognized markers
     prefix_candidate = base_no_ext
     if match:
-        # remove the matched "StacksNeurons3" from the end
         prefix_candidate = prefix_candidate[: match.start(1)]
 
-    # remove magnification
     if magnification is not None:
         prefix_candidate = prefix_candidate.replace(mag_keyword, "")
-    # remove the cars keyword
     if contains_cars:
         prefix_candidate = prefix_candidate.replace(cars_keyword, "")
 
-    # remove all found markers
     for mk in found_markers:
         prefix_candidate = prefix_candidate.replace(mk, "")
 
-    # Now remove trailing dashes or underscores
     prefix_candidate = re.sub(r"[-_]+$", "", prefix_candidate)
     prefix_candidate = prefix_candidate.strip()
 
-    # Build result
     meta = {
         "base_no_ext": base_no_ext,
-        "prefix": prefix_candidate,   # e.g. "AD44-S1159"
+        "prefix": prefix_candidate,
         "markers_found": found_markers,
         "contains_cars": contains_cars,
         "magnification": magnification,
@@ -331,7 +336,8 @@ def get_file_key(filename):
     3) Takes everything before that as the 'prefix candidate'.
     4) Removes known keywords (fluorescence markers, cars keyword, magnification keyword)
        from the prefix candidate, plus any leftover dashes.
-    5) Parses the 'Stacks' portion for optional label/digits (applying offsets if fluorescence).
+    5) Parses the 'Stacks' portion for optional label/digits (applying offsets if
+       fluorescence).
     6) Rebuilds the final key with the cleaned prefix + Stacks suffix.
 
     Parameters
@@ -352,7 +358,6 @@ def get_file_key(filename):
     base = filename.replace(".nd2", "")
     is_cars = config["file_keywords"]["cars_keyword"] in base
 
-    # Find the "Stacks..." portion at the END of the filename
     match = re.search(r"(Stacks[A-Za-z]*\d*)$", base)
     if not match:
         raise ValueError(f"No valid 'Stacks...' found in filename: {filename}")
@@ -360,28 +365,26 @@ def get_file_key(filename):
     stacks_part = match.group(1)
     prefix_candidate = base[: match.start(1)]
 
-    # Remove known keywords from the prefix
     removal_candidates = (
         config["file_keywords"]["fluorescence_markers"]
-        + [config["file_keywords"]["cars_keyword"],
-           config["file_keywords"]["magnification_keyword"]]
+        + [
+            config["file_keywords"]["cars_keyword"],
+            config["file_keywords"]["magnification_keyword"]
+        ]
     )
     for kw in removal_candidates:
         prefix_candidate = prefix_candidate.replace(kw, "")
 
-    # Clean up leftover repeated dashes
     prefix_candidate = re.sub(r"-+", "-", prefix_candidate)
     prefix_candidate = prefix_candidate.strip("-")
 
-    # Parse out optional label/digits from stacks_part
     match_stacks = re.search(r"Stacks([A-Za-z]*)(\d*)", stacks_part)
     if not match_stacks:
         raise ValueError(f"Could not parse the 'Stacks' suffix: {stacks_part}")
 
-    label_part = match_stacks.group(1)  # e.g. "Microglia" or ""
-    digit_part = match_stacks.group(2)  # e.g. "3" or ""
+    label_part = match_stacks.group(1)
+    digit_part = match_stacks.group(2)
 
-    # If numeric suffix, apply offsets if it's fluorescence
     if digit_part:
         stack_num = int(digit_part)
         if not is_cars:
@@ -394,7 +397,6 @@ def get_file_key(filename):
     else:
         final_stacks_part = f"Stacks{label_part}"
 
-    # Rebuild final key
     if prefix_candidate:
         final_key = f"{prefix_candidate}-{final_stacks_part}"
     else:
@@ -426,12 +428,11 @@ def create_custom_colormap(start_color, end_color):
     return LinearSegmentedColormap.from_list("custom_colormap", colors)
 
 
-def process_fluorescence_channel(image_slice, min_size,
-                                 closing_radius, gaussian_sigma, fill_holes,
-                                 threshold_method, offset,
-                                 exclude_dark_regions=True,
-                                 dark_threshold=50,
-                                 min_hole_size=20000):
+def process_fluorescence_channel(
+    image_slice, min_size, closing_radius, gaussian_sigma, fill_holes,
+    threshold_method, offset, exclude_dark_regions=True,
+    dark_threshold=50, min_hole_size=20000
+):
     """
     Process a single fluorescence image slice and create a binary mask.
 
@@ -453,6 +454,16 @@ def process_fluorescence_channel(image_slice, min_size,
         Sigma for the Gaussian filter.
     fill_holes : bool
         Whether to fill holes in the binary mask.
+    threshold_method : str
+        The thresholding method to use ('otsu', 'li', 'triangle', 'yen').
+    offset : float
+        Multiplier for the threshold value (default 1.0).
+    exclude_dark_regions : bool
+        Whether to exclude large dark holes from thresholding.
+    dark_threshold : float
+        Pixel intensity below which pixels are considered "dark".
+    min_hole_size : int
+        Minimum connected area (in pixels) for a dark region to be a hole.
 
     Returns
     -------
@@ -469,51 +480,55 @@ def process_fluorescence_channel(image_slice, min_size,
 
     image_slice = np.nan_to_num(image_slice)
     smoothed_image = gaussian(image_slice, sigma=gaussian_sigma, preserve_range=True)
-    
-    # (Optional) Exclude large dark holes from threshold
-    if exclude_dark_regions:
-        # Create a preliminary mask for very dark pixels
-        preliminary_dark_mask = smoothed_image < dark_threshold
 
-        # Label connected regions in that dark mask
+    if exclude_dark_regions:
+        preliminary_dark_mask = smoothed_image < dark_threshold
         labeled_dark = measure.label(preliminary_dark_mask)
         props = measure.regionprops(labeled_dark)
-
-        # Build a final 'exclude_mask' for large holes
         exclude_mask = np.zeros_like(labeled_dark, dtype=bool)
         for region in props:
             if region.area >= min_hole_size:
-                # Mark all pixels in that region as exclude
                 coords = region.coords
                 exclude_mask[coords[:, 0], coords[:, 1]] = True
-
-        # We'll only use the pixels that are NOT excluded when computing threshold
         valid_pixels = smoothed_image[~exclude_mask].ravel()
     else:
         exclude_mask = np.zeros_like(smoothed_image, dtype=bool)
         valid_pixels = smoothed_image.ravel()
-    
-    # Pick which threshold function to call
-    if threshold_method.lower() == "otsu":
-        base_threshold = threshold_otsu(valid_pixels)
-    elif threshold_method.lower() == "li":
-        base_threshold = threshold_li(valid_pixels)
-    elif threshold_method.lower() == "triangle":
-        base_threshold = threshold_triangle(valid_pixels)
-    elif threshold_method.lower() == "yen":
-        base_threshold = threshold_yen(valid_pixels)
+
+    thr_m = threshold_method.lower()
+    if len(valid_pixels) > 0:
+        if thr_m == "otsu":
+            base_threshold = threshold_otsu(valid_pixels)
+        elif thr_m == "li":
+            base_threshold = threshold_li(valid_pixels)
+        elif thr_m == "triangle":
+            base_threshold = threshold_triangle(valid_pixels)
+        elif thr_m == "yen":
+            base_threshold = threshold_yen(valid_pixels)
+        else:
+            base_threshold = threshold_otsu(valid_pixels)
     else:
-        # fallback
-        base_threshold = threshold_otsu(valid_pixels)
-    
+        base_threshold = 0
+
     final_threshold = base_threshold * offset
     binary_mask = smoothed_image > final_threshold
+    binary_mask[exclude_mask] = False
+
     binary_closed = closing(binary_mask, disk(closing_radius))
     if fill_holes:
         binary_closed = ndi.binary_fill_holes(binary_closed)
 
     cleaned_mask = remove_small_objects(binary_closed, min_size=min_size)
     return cleaned_mask
+
+
+def robust_mad(a):
+    """
+    Simple helper to compute median absolute deviation.
+    Returns median(|x - median(x)|).
+    """
+    med = np.median(a)
+    return np.median(np.abs(a - med))
 
 
 def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
@@ -554,8 +569,6 @@ def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
     pixel_vals = data_dict['smoothed'].ravel()
     median_val = np.median(pixel_vals)
     mad_val = robust_mad(pixel_vals)
-    
-    # For normal data, std ~ 1.4826 * MAD
     approx_std = 1.4826 * mad_val
     threshold_val = median_val + (std_dev_multiplier * approx_std)
     data_dict['mask_std'] = data_dict['smoothed'] > threshold_val
@@ -587,15 +600,6 @@ def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
             final_mask[tuple(region.coords.T)] = True
 
     return final_mask
-
-
-def robust_mad(a):
-    """
-    Simple helper to compute median absolute deviation.
-    Returns median(|x - median(x)|).
-    """
-    med = np.median(a)
-    return np.median(np.abs(a - med))
 
 
 def process_hyperspectral_series(spectrum_folder, reference_image, output_path, foci_params):
@@ -665,54 +669,39 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
             intensities.append(mean_intensity)
         lipid_data.append([lipid_id] + intensities)
 
-    # Build DF with "Wavenumber 1..32"
     columns_raw = ["Lipid ID"] + [f"Wavenumber {i+1}" for i in range(32)]
     lipid_df_raw = pd.DataFrame(lipid_data, columns=columns_raw)
-
-    # Create a normalized version
     lipid_df_norm = lipid_df_raw.copy()
 
     def compute_wavenumber(lambda_nm):
         """Compute wavenumber from wavelength in nm using 1e7*(1/lambda_nm - 1/1031)."""
         return 1.0e7 * ((1.0 / lambda_nm) - (1.0 / 1031.0))
 
-    # Generate 32 wavelengths from 801 nm down to 785.5 nm (0.5 nm steps)
     wavelengths_nm = [801.0 - 0.5 * i for i in range(32)]
     wavenumbers = [compute_wavenumber(wl) for wl in wavelengths_nm]
 
-    # Rename the columns in lipid_df_norm
     new_col_names = ["Lipid ID"] + [f"{wn:.2f}" for wn in wavenumbers]
-
-    # Normalize each row (excluding column 0)
     data_to_normalize = lipid_df_norm.iloc[:, 1:]
     row_maxes = data_to_normalize.max(axis=1).replace({0: 1})
     lipid_df_norm.iloc[:, 1:] = data_to_normalize.div(row_maxes, axis=0)
     lipid_df_norm.columns = new_col_names
 
-    # Save both sheets
     with pd.ExcelWriter(output_path) as writer:
         lipid_df_raw.to_excel(writer, sheet_name='Raw Data', index=False)
         lipid_df_norm.to_excel(writer, sheet_name='Normalized Data', index=False)
 
     print(f"Hyperspectral lipid intensities saved to {output_path}")
 
-    # Let's assume wavenumber "19" means the 19th column => index=19 in DF
-    # Actually, the first column is "Lipid ID", so intensities start at col=1 => array idx=0
-    # => "Wavenumber 9" => col=9 => array idx=8
-    # => "Wavenumber 19" => col=19 => array idx=18
     idx_2850 = 1 + 8   # column index for "Wavenumber 9"
     idx_2930 = 1 + 18  # column index for "Wavenumber 19"
 
-    # Initialize ratio_map to -1 (for background)
     ratio_map = np.full_like(lipid_labels, fill_value=-1, dtype=np.float32)
-
-    # Also track ratio_values for droplet pixels
     ratio_values = []
 
     for row in lipid_df_raw.itertuples(index=False):
         lipid_id = row[0]
-        intens_2850 = row[idx_2850]  # wavenumber 9
-        intens_2930 = row[idx_2930]  # wavenumber 19
+        intens_2850 = row[idx_2850]
+        intens_2930 = row[idx_2930]
 
         if intens_2850 > 0:
             ratio_val = intens_2930 / intens_2850
@@ -728,32 +717,24 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
 
     ratio_min = np.min(ratio_values)
     ratio_max = np.max(ratio_values) if np.max(ratio_values) > 0 else 1.0
-
-    # Normalize ratio in [ratio_min..ratio_max] -> [0..1]
     ratio_norm = (ratio_map - ratio_min) / (ratio_max - ratio_min + 1e-9)
-    # Clip valid droplet pixels, background <0
     ratio_norm_clipped = np.clip(ratio_norm, 0.0, 1.0)
 
-    # Build colormap from yellow->red
     cmap = LinearSegmentedColormap.from_list(
         'yellow_red', [(1.0, 1.0, 0.0), (1.0, 0.0, 0.0)]
     )
-
-    ratio_rgba = cmap(ratio_norm_clipped)  # shape (H, W, 4)
+    ratio_rgba = cmap(ratio_norm_clipped)
     ratio_rgb = (ratio_rgba[..., :3] * 255).astype(np.uint8)
 
-    # Force background to black
     bg_mask = (ratio_map < 0)
     ratio_rgb[bg_mask] = [0, 0, 0]
 
-    # Display
     plt.figure(figsize=(6, 6))
     plt.imshow(ratio_rgb)
     plt.title("Droplet Ratio Map (2930 / 2850)")
     plt.axis('off')
     plt.show()
 
-    # Save as PNG
     ratio_bgr = cv2.cvtColor(ratio_rgb, cv2.COLOR_RGB2BGR)
     out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
     cv2.imwrite(out_path_ratio, ratio_bgr)
@@ -788,9 +769,9 @@ def visualize_hyperspectral_mask_overlay(cars_image, lipid_mask):
 
     max_val = cars_image.max() if cars_image.max() > 0 else 1
     grayscale_8bit = (cars_image / max_val * 255).astype(np.uint8)
-    lipid_mask_rgb = create_rgb_mask(lipid_mask, [255, 255, 0])  # yellow
+    lipid_mask_rgb = create_rgb_mask(lipid_mask, [255, 255, 0])
 
-    grayscale_rgb = np.stack([grayscale_8bit]*3, axis=-1)
+    grayscale_rgb = np.stack([grayscale_8bit] * 3, axis=-1)
     overlay_rgb = np.clip(
         0.5 * grayscale_rgb + 0.5 * lipid_mask_rgb, 0, 255
     ).astype(np.uint8)
@@ -858,12 +839,11 @@ def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
         lipid_count = 0
         total_lipid_area = 0.0
 
-        # Calculate properties of each lipid object in the cell
-        for lipid in measure.regionprops(lipid_objects_in_cell,
-                                         intensity_image=cars_image):
+        for lipid in measure.regionprops(
+            lipid_objects_in_cell, intensity_image=cars_image
+        ):
             lipid_size_pixels = lipid.area
             lipid_size_um2 = lipid_size_pixels * (pixel_size_microns ** 2)
-
             lipid_count += 1
             total_lipid_area += lipid_size_um2
 
@@ -933,13 +913,14 @@ def generate_reference_image(reference_file, output_path, blur_radius_microns):
 
     reference_img = apply_east_shadows_filter(reference_img)
     sigma_pixels = blur_radius_microns / pixel_size_microns
-    print(f"Applying Gaussian blur (sigma={sigma_pixels:.2f} pixels) "
-          f"from {blur_radius_microns} microns")
+    print(
+        f"Applying Gaussian blur (sigma={sigma_pixels:.2f} pixels) "
+        f"from {blur_radius_microns} microns"
+    )
 
-    blurred_reference = gaussian(reference_img,
-                                 sigma=sigma_pixels,
-                                 preserve_range=True)
-
+    blurred_reference = gaussian(
+        reference_img, sigma=sigma_pixels, preserve_range=True
+    )
     blurred_ref_max = np.max(blurred_reference)
     original_max = np.max(reference_img)
 
@@ -949,7 +930,9 @@ def generate_reference_image(reference_file, output_path, blur_radius_microns):
     blurred_reference_scaled = blurred_reference * (original_max / blurred_ref_max)
     max_value = np.max(blurred_reference_scaled)
     if max_value <= 0:
-        raise ValueError("Reference image has no valid intensity data after preprocessing.")
+        raise ValueError(
+            "Reference image has no valid intensity data after preprocessing."
+        )
 
     normalized_reference = blurred_reference_scaled / max_value
     imwrite(output_path, (normalized_reference * 255).astype(np.uint8))
@@ -1028,8 +1011,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
     channel_map = config["channel_map"]
 
-    # Try to parse "Stacks..." from the filename with get_file_key, but if it fails or not found,
-    # we won't raise an error. We'll just set stacks_label = ""
+    # Try to parse "Stacks..." from the filename with get_file_key, but if it fails:
     try:
         file_key = get_file_key(os.path.basename(fluorescence_path))
     except ValueError:
@@ -1054,7 +1036,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
     with ND2Reader(fluorescence_path) as fluoro_nd2, ND2Reader(cars_path) as cars_nd2:
         print(f"File: {fluorescence_path}")
-
         fluoro_nd2.iter_axes = 'v'
         cars_nd2.iter_axes = 'v'
         pixel_size_microns = fluoro_nd2.metadata['pixel_microns']
@@ -1063,9 +1044,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             """Read z-slices from channel c_index, apply East-shadows, do max-projection."""
             z_stack_slices_cars = []
             for z_slice in range(nd2obj.sizes['z']):
-                raw_sl = np.nan_to_num(nd2obj.get_frame_2D(v=position,
-                                                           c=c_index,
-                                                           z=z_slice))
+                raw_sl = np.nan_to_num(nd2obj.get_frame_2D(v=position, c=c_index, z=z_slice))
                 correlated_sl = apply_east_shadows_filter(raw_sl)
                 z_stack_slices_cars.append(correlated_sl)
             return np.max(np.array(z_stack_slices_cars), axis=0)
@@ -1074,21 +1053,21 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             """Read z-slices from ch_idx, do max-projection."""
             z_stack_slices_fl = []
             for z_slice in range(nd2obj.sizes['z']):
-                raw_fl = np.nan_to_num(nd2obj.get_frame_2D(v=position,
-                                                           c=ch_idx,
-                                                           z=z_slice))
+                raw_fl = np.nan_to_num(
+                    nd2obj.get_frame_2D(v=position, c=ch_idx, z=z_slice)
+                )
                 z_stack_slices_fl.append(raw_fl)
             return np.max(np.array(z_stack_slices_fl), axis=0)
 
-        # Iterate over positions (v)
         for pos in range(fluoro_nd2.sizes['v']):
             fluoro_nd2.default_coords['v'] = pos
             cars_nd2.default_coords['v'] = pos
-            
-            file_stub = os.path.splitext(os.path.basename(fluorescence_path))[0]
+
+            file_stub = os.path.splitext(
+                os.path.basename(fluorescence_path)
+            )[0]
             file_stub += f"_pos{pos+1}"
 
-            # 1) Attempt to read the DAPI channel
             dapi_ch_idx = config["channel_map"].get("DAPI", None)
             if dapi_ch_idx is not None:
                 z_stack_slices_dapi = []
@@ -1099,72 +1078,64 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     z_stack_slices_dapi.append(raw_dapi)
                 dapi_slice = np.max(np.array(z_stack_slices_dapi), axis=0)
 
-                # Build a DAPI mask
                 dapi_mask = process_fluorescence_channel(
-                    dapi_slice,
-                    **config["morphology_params"]["nuclei_params"]
+                    dapi_slice, **config["morphology_params"]["nuclei_params"]
                 )
             else:
                 dapi_mask = None
 
-            # 2) Read & correct the CARS channel
             cars_slice = max_project_cars(cars_nd2, 2, pos)
             corrected_cars_slice = np.nan_to_num(cars_slice / reference_image)
-            
-            # Gather multiple fluorescence images into a composite
-            
+
             fluor_images_for_display = {}
-            
             for cm in chosen_cell_markers:
                 if cm in fluorescence_path:
                     ch_idx = channel_map.get(cm, None)
                     if ch_idx is not None:
-                        # Max-project that channel
                         z_stack_fl = []
                         for z_idx in range(fluoro_nd2.sizes['z']):
-                            raw_slice = np.nan_to_num(fluoro_nd2.get_frame_2D(v=pos, c=ch_idx, z=z_idx))
+                            raw_slice = np.nan_to_num(
+                                fluoro_nd2.get_frame_2D(v=pos, c=ch_idx, z=z_idx)
+                            )
                             z_stack_fl.append(raw_slice)
-                        fluor_images_for_display[cm] = np.max(np.array(z_stack_fl), axis=0)
-                    
-            # Build a color composite from those channels
+                        fluor_images_for_display[cm] = np.max(
+                            np.array(z_stack_fl), axis=0
+                        )
+
             if len(fluor_images_for_display) > 0:
                 composite_fluor = composite_fluorescence(fluor_images_for_display, config)
             else:
-                # If somehow none are present, fall back to an empty or single-channel image
-                composite_fluor = np.zeros((corrected_cars_slice.shape[0], corrected_cars_slice.shape[1], 3), dtype=np.uint8)
+                composite_fluor = np.zeros(
+                    (
+                        corrected_cars_slice.shape[0],
+                        corrected_cars_slice.shape[1],
+                        3
+                    ), dtype=np.uint8
+                )
 
-            # Display the main analysis marker + the CARS
             fig, axs = plt.subplots(1, 2, figsize=(10, 5))
             axs[0].imshow(composite_fluor)
             axs[0].set_title(f"Max Projected Fluorescence Overlay (pos={pos+1})")
             axs[0].axis('off')
-            
+
             axs[1].imshow(corrected_cars_slice, cmap='gray')
             axs[1].set_title(f"Max Projected CARS (pos={pos+1})")
             axs[1].axis('off')
-            
             plt.show()
 
-            # 3) Identify lipid droplets
             cars_foci_mask = find_foci(corrected_cars_slice, **foci_params)
 
-            # 4) For each cell marker, build a cell mask and analyze
             for cm in chosen_cell_markers:
                 if cm in fluorescence_path:
                     cm_channel_idx = channel_map.get(cm, None)
                     if cm_channel_idx is None:
                         continue
-                    cm_slice = max_project_channel(fluoro_nd2,
-                                                   cm_channel_idx, pos)
-                    
-                    # 1) Pull global fluorescence params
-                    base_fluor_params = config["morphology_params"]["fluorescence_params"]
+                    cm_slice = max_project_channel(fluoro_nd2, cm_channel_idx, pos)
 
-                    # 2) Get marker-specific threshold settings if present
+                    base_fluor_params = config["morphology_params"]["fluorescence_params"]
                     marker_thresholds = config.get("marker_thresholds", {})
                     cm_thresholds = marker_thresholds.get(cm, {})
 
-                    # 3) Decide final threshold method & offset
                     threshold_method = cm_thresholds.get(
                         "threshold_method",
                         base_fluor_params.get("threshold_method", "otsu")
@@ -1173,8 +1144,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         "offset",
                         base_fluor_params.get("offset", 1.0)
                     )
-                    
-                    # 4) Now call process_fluorescence_channel
+
                     cm_mask = process_fluorescence_channel(
                         cm_slice,
                         min_size=base_fluor_params["min_size"],
@@ -1194,7 +1164,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         pixel_size_microns=pixel_size_microns
                     )
 
-                    # Tag with the cell marker name
                     for r_item in pos_results:
                         r_item["cell_marker"] = cm
                     for s_item in pos_summary:
@@ -1203,7 +1172,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     all_positions_results.extend(pos_results)
                     all_positions_summary.extend(pos_summary)
 
-                    # (Optional) Visual: final masks
                     def create_rgb_mask(bin_mask, rgb_color):
                         """Create an RGB mask from a binary mask."""
                         rgb_m = np.zeros((*bin_mask.shape, 3), dtype=np.uint8)
@@ -1216,7 +1184,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
                     cell_rgb_mask = create_rgb_mask(cm_mask, green)
                     cars_rgb_mask = create_rgb_mask(cars_foci_mask, yellow)
-
                     overlay_rgb_mask = np.clip(
                         0.5 * cell_rgb_mask + 0.5 * cars_rgb_mask,
                         0, 255
@@ -1236,24 +1203,18 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     axs_mask[2].axis('off')
                     plt.show()
 
-                    # NEW: If DAPI is present, save transparent overlay
                     if dapi_mask is not None:
-                        images_dir = ensure_subdirectory(config["paths"]["data_directory"], "Images")
-                        
-                        # Use file_stub so each overlay gets the correct prefix (e.g., AD44-S1159_pos2)
+                        images_dir = ensure_subdirectory(
+                            config["paths"]["data_directory"], "Images"
+                        )
                         out_overlay_path = os.path.join(
                             images_dir,
                             f"{file_stub}_DAPI_{cm}.png"
                         )
-                        # Pass the marker name so we can retrieve the color from config
                         save_dapi_marker_overlay(
-                            dapi_mask,
-                            cm_mask,
-                            cm,
-                            out_overlay_path
+                            dapi_mask, cm_mask, cm, out_overlay_path
                         )
 
-            # 5) Gather all fluorescence channels for final composites
             fluor_images_for_composite = {}
             for marker_name, ch_idx in channel_map.items():
                 if ch_idx is None:
@@ -1359,8 +1320,10 @@ def blend_fluorescence_cars(fluor_rgb, cars_gray, alpha=0.5):
         The blended composite in 8-bit color.
     """
     cars_rgb = np.stack([cars_gray, cars_gray, cars_gray], axis=-1)
-    blended_float = (alpha * fluor_rgb.astype(np.float32)
-                     + (1 - alpha) * cars_rgb.astype(np.float32))
+    blended_float = (
+        alpha * fluor_rgb.astype(np.float32)
+        + (1 - alpha) * cars_rgb.astype(np.float32)
+    )
     blended = np.clip(blended_float, 0, 255).astype(np.uint8)
     return blended
 
@@ -1389,8 +1352,9 @@ def composite_fluorescence(fluor_images, config_dict):
     composite_float = np.zeros((height, width, 3), dtype=np.float32)
 
     for marker_name, img_2d in fluor_images.items():
-        rgb_255 = config_dict["colormaps"].get(marker_name,
-                                               config_dict["colormaps"]["DEFAULT"])
+        rgb_255 = config_dict["colormaps"].get(
+            marker_name, config_dict["colormaps"]["DEFAULT"]
+        )
         rgb_float = np.array(rgb_255) / 255.0
         colorized = colorize_channel(img_2d, rgb_float)
         composite_float += colorized.astype(np.float32)
@@ -1452,17 +1416,12 @@ def save_composite_images(fluor_images, cars_image, config_dict,
     """
     out_dir = ensure_subdirectory(main_dir, "Images")
 
-    # 1) Composite the fluorescence channels
     composite_fluor = composite_fluorescence(fluor_images, config_dict)
-
-    # 2) Convert CARS to grayscale
     cars_gray_8bit = grayscale_autoscale(cars_image)
+    fluor_cars_blended = blend_fluorescence_cars(
+        composite_fluor, cars_gray_8bit, alpha=0.5
+    )
 
-    # 3) Blend them
-    fluor_cars_blended = blend_fluorescence_cars(composite_fluor,
-                                                 cars_gray_8bit, alpha=0.5)
-
-    # Convert to BGR for OpenCV saving
     fluor_bgr = cv2.cvtColor(composite_fluor, cv2.COLOR_RGB2BGR)
     blend_bgr = cv2.cvtColor(fluor_cars_blended, cv2.COLOR_RGB2BGR)
 
@@ -1487,7 +1446,8 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
     marker_mask : ndarray (bool)
         Binary mask for the cell marker channel.
     marker_name : str
-        Name of the cell marker, e.g. 'IBA1', 'GFAP'. This is used to fetch the color from config.
+        Name of the cell marker, e.g. 'IBA1', 'GFAP'. This is used to fetch
+        the color from config.
     out_path : str
         Output .png file path to save the overlay image.
 
@@ -1496,42 +1456,44 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
     None
         Saves a .png file with RGBA channels.
     """
-
-    # 1) Build an RGBA array (H, W, 4)
     height, width = dapi_mask.shape
     rgba = np.zeros((height, width, 4), dtype=np.uint8)
 
-    # 2) Fetch DAPI color from config and set it to half alpha
     dapi_color_255 = config["colormaps"].get("DAPI", (0, 0, 255))
-    dapi_rgba = (dapi_color_255[0], dapi_color_255[1], dapi_color_255[2], 128)
+    dapi_rgba = (
+        dapi_color_255[0],
+        dapi_color_255[1],
+        dapi_color_255[2],
+        128
+    )
 
-    # 3) Fetch marker color from config, fully opaque
-    marker_color_255 = config["colormaps"].get(marker_name, config["colormaps"]["DEFAULT"])
-    marker_rgba = (marker_color_255[0], marker_color_255[1], marker_color_255[2], 255)
+    marker_color_255 = config["colormaps"].get(
+        marker_name, config["colormaps"]["DEFAULT"]
+    )
+    marker_rgba = (
+        marker_color_255[0],
+        marker_color_255[1],
+        marker_color_255[2],
+        255
+    )
 
-    # 4) Find the outline of the marker_mask
     outline = find_boundaries(marker_mask, mode='outer')
-
-    # 5) Fill the DAPI region
     rgba[dapi_mask, 0] = dapi_rgba[0]
     rgba[dapi_mask, 1] = dapi_rgba[1]
     rgba[dapi_mask, 2] = dapi_rgba[2]
     rgba[dapi_mask, 3] = dapi_rgba[3]
 
-    # 6) Fill the marker outline
     outline_positions = (outline == 1)
     rgba[outline_positions, 0] = marker_rgba[0]
     rgba[outline_positions, 1] = marker_rgba[1]
     rgba[outline_positions, 2] = marker_rgba[2]
     rgba[outline_positions, 3] = marker_rgba[3]
 
-    # 7) Save as PNG with alpha
     pil_img = Image.fromarray(rgba, mode='RGBA')
     pil_img.save(out_path)
     print(f"Saved overlay to: {out_path}")
 
 
-# Main Workflow
 if __name__ == "__main__":
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')
@@ -1563,7 +1525,7 @@ if __name__ == "__main__":
     # 3) Process hyperspectral series
     hyperspectral_foci_params = config["morphology_params"].get(
         "foci_params_hyperspectral",
-        config["morphology_params"]["foci_params"]  # fallback if not defined
+        config["morphology_params"]["foci_params"]
     )
     for folder in hyperspectral_folders:
         folder_name = os.path.basename(folder)

@@ -61,7 +61,7 @@ config = {
         "DEFAULT": (255, 255, 255)  # fallback color (white)
     },
     "paths": {
-        "data_directory": r"C:\Users\clchr\Downloads\AD3c",
+        "data_directory": r"C:\Users\clchr\Downloads\AD3a",
     },
     "stack_offset": {
         "DAPI": 0,
