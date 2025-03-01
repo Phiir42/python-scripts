@@ -87,7 +87,8 @@ from skimage.morphology import closing, disk, opening, remove_small_objects
 from skimage.segmentation import find_boundaries
 from tifffile import imwrite
 
-from config_alzheimersTissue import config
+import argparse
+import importlib.util
 
 # Suppress excessive logs from nd2reader
 logging.getLogger('nd2reader').setLevel(logging.ERROR)
@@ -99,6 +100,14 @@ EAST_SHADOWS_KERNEL = np.array(
         [-1, 0, 1]
     ], dtype=np.float32
 )
+
+
+def load_config(py_file_path):
+    """Dynamically load a Python config file as a module and return `config`."""
+    spec = importlib.util.spec_from_file_location("cfg_module", py_file_path)
+    cfg_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg_mod)
+    return cfg_mod.config
 
 
 def apply_east_shadows_filter(image):
@@ -429,9 +438,9 @@ def create_custom_colormap(start_color, end_color):
 
 
 def process_fluorescence_channel(
-    image_slice, min_size, closing_radius, gaussian_sigma, fill_holes,
+    image_slice, cell_size, min_size, closing_radius, gaussian_sigma, fill_holes,
     threshold_method, offset, exclude_dark_regions=True,
-    dark_threshold=50, min_hole_size=20000
+    dark_threshold=50, min_hole_size=20000, debug=True
 ):
     """
     Process a single fluorescence image slice and create a binary mask.
@@ -479,10 +488,9 @@ def process_fluorescence_channel(
         raise ValueError(f"Expected a 2D array, but got shape {image_slice.shape}")
 
     image_slice = np.nan_to_num(image_slice)
-    smoothed_image = gaussian(image_slice, sigma=gaussian_sigma, preserve_range=True)
 
     if exclude_dark_regions:
-        preliminary_dark_mask = smoothed_image < dark_threshold
+        preliminary_dark_mask = image_slice < dark_threshold
         labeled_dark = measure.label(preliminary_dark_mask)
         props = measure.regionprops(labeled_dark)
         exclude_mask = np.zeros_like(labeled_dark, dtype=bool)
@@ -490,10 +498,10 @@ def process_fluorescence_channel(
             if region.area >= min_hole_size:
                 coords = region.coords
                 exclude_mask[coords[:, 0], coords[:, 1]] = True
-        valid_pixels = smoothed_image[~exclude_mask].ravel()
+        valid_pixels = image_slice[~exclude_mask].ravel()
     else:
-        exclude_mask = np.zeros_like(smoothed_image, dtype=bool)
-        valid_pixels = smoothed_image.ravel()
+        exclude_mask = np.zeros_like(image_slice, dtype=bool)
+        valid_pixels = image_slice.ravel()
 
     thr_m = threshold_method.lower()
     if len(valid_pixels) > 0:
@@ -508,18 +516,47 @@ def process_fluorescence_channel(
         else:
             base_threshold = threshold_otsu(valid_pixels)
     else:
-        base_threshold = 0
+        base_threshold = 999999;
 
     final_threshold = base_threshold * offset
-    binary_mask = smoothed_image > final_threshold
+    binary_mask = image_slice > final_threshold
     binary_mask[exclude_mask] = False
+    
+    cleaned_mask = remove_small_objects(binary_mask, min_size=min_size)
 
-    binary_closed = closing(binary_mask, disk(closing_radius))
+    binary_closed = closing(cleaned_mask, disk(closing_radius))
     if fill_holes:
         binary_closed = ndi.binary_fill_holes(binary_closed)
 
-    cleaned_mask = remove_small_objects(binary_closed, min_size=min_size)
-    return cleaned_mask
+    cell_mask = remove_small_objects(binary_closed, min_size=cell_size)
+    
+    # =========== DEBUG PLOTS IF DESIRED ================
+    if debug:
+        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        axes[0].imshow(image_slice, cmap='gray')
+        axes[0].set_title("Raw Fluorescence")
+
+        # Show thresholded mask (before morphological closing/fill)
+        axes[1].imshow(binary_mask, cmap='gray')
+        axes[1].set_title(f"Thresholded (> {final_threshold:.2f})")
+
+        axes[2].imshow(cleaned_mask, cmap='gray')
+        axes[2].set_title("After First Cleaning")
+
+        axes[3].imshow(binary_closed, cmap='gray')
+        axes[3].set_title("After Closing + Fill")
+        
+        axes[4].imshow(cell_mask, cmap='gray')
+        axes[4].set_title("Final Cleaned Mask")
+
+        for ax in axes:
+            ax.axis('off')
+        plt.suptitle(f"Method: {threshold_method}, offset={offset:.2f}, closing={closing_radius}")
+        plt.tight_layout()
+        plt.show()
+    # ====================================================
+    
+    return cell_mask
 
 
 def robust_mad(a):
@@ -531,73 +568,174 @@ def robust_mad(a):
     return np.median(np.abs(a - med))
 
 
-def find_foci(image_slice, sigma, min_distance, min_size, std_dev_multiplier):
+def find_foci(
+    image_slice,
+    sigma,
+    min_distance,
+    min_size,
+    std_dev_multiplier,
+    remove_saturated,
+    saturation_threshold,
+    saturated_min_size,
+    debug=False
+):
     """
-    Identify foci within a CARS image slice using local maxima and thresholding.
+    Identify foci within a CARS image slice using local maxima and thresholding,
+    optionally ignoring large saturated regions.
 
-    1) Applies Gaussian smoothing.
-    2) Thresholds using mean+std_dev_multiplier and Otsu.
-    3) Combines masks, morphological opening, local maxima detection.
-    4) Watershed segmentation to separate objects.
-    5) Retains objects >= min_size.
+    Steps:
+    1) (Optional) Remove large saturated objects above 'saturation_threshold' intensity
+       if 'remove_saturated' is True.
+    2) (Optional) Gaussian smoothing if sigma>0.
+    3) Compute robust median+MAD for threshold => create 'mask_std'.
+    4) Morphological opening, local maxima detection, watershed.
+    5) Retain objects >= 'min_size'.
+    6) If debug=True, display step-by-step figures.
 
     Parameters
     ----------
     image_slice : ndarray
         2D CARS image data.
     sigma : float
-        Sigma for the Gaussian filter.
+        Sigma for the Gaussian filter (if >0).
     min_distance : int
         Minimum distance between local maxima.
     min_size : int
         Minimum area (in pixels) for each focus to be retained.
     std_dev_multiplier : float
-        Multiplier for the standard deviation threshold.
+        Multiplier for the robust standard deviation threshold.
+    remove_saturated : bool
+        Whether to exclude very bright objects from thresholding logic.
+    saturation_threshold : float
+        Intensity above which we consider the object "saturated."
+    saturated_min_size : int
+        Minimum connected area to be considered a large saturated region.
+    debug : bool
+        If True, display debug prints and intermediate plots.
 
     Returns
     -------
     final_mask : ndarray (bool)
         Binary mask for the identified foci.
     """
+    import matplotlib.pyplot as plt
+
     image_slice = np.nan_to_num(image_slice)
-    data_dict = {}
+    original = image_slice.copy()
 
-    # 1) Smooth
-    data_dict['smoothed'] = gaussian(image_slice, sigma=sigma, preserve_range=True)
+    # 1) Exclude large saturated objects
+    exclude_mask = np.zeros_like(image_slice, dtype=bool)
+    if remove_saturated:
+        preliminary_sat_mask = image_slice > saturation_threshold
+        labeled_sat = measure.label(preliminary_sat_mask)
+        if debug:
+            print(f"[DEBUG] Checking for saturated objects above {saturation_threshold}...")
 
-    # 2) Thresholds
-    pixel_vals = data_dict['smoothed'].ravel()
-    median_val = np.median(pixel_vals)
-    mad_val = robust_mad(pixel_vals)
-    approx_std = 1.4826 * mad_val
-    threshold_val = median_val + (std_dev_multiplier * approx_std)
-    data_dict['mask_std'] = data_dict['smoothed'] > threshold_val
+        for region in measure.regionprops(labeled_sat):
+            if region.area >= saturated_min_size:
+                coords = region.coords
+                exclude_mask[coords[:, 0], coords[:, 1]] = True
 
-    global_thresh = threshold_otsu(data_dict['smoothed'])
-    data_dict['mask_otsu'] = data_dict['smoothed'] > global_thresh
+        if debug:
+            sat_count = np.count_nonzero(exclude_mask)
+            print(f"[DEBUG] Excluding {sat_count} pixels from saturated regions.")
 
-    # 3) Combine masks & open
-    data_dict['combined'] = data_dict['mask_std'] & data_dict['mask_otsu']
-    data_dict['opened'] = opening(data_dict['combined'], disk(3))
+    # 2) Optional smoothing
+    if sigma > 0:
+        smoothed = gaussian(image_slice, sigma=sigma, preserve_range=True)
+    else:
+        smoothed = image_slice.copy()
 
-    # 4) Local maxima + watershed
-    distance = ndi.distance_transform_edt(data_dict['opened'])
+    # Use only non-excluded pixels for threshold calculation
+    valid_pixels = smoothed[~exclude_mask].ravel()
+
+    # 3) Compute robust median+MAD threshold => mask_std
+    if len(valid_pixels) > 0:
+        median_val = np.median(valid_pixels)
+        mad_val = robust_mad(valid_pixels)
+        approx_std = 1.4826 * mad_val
+        threshold_val = median_val + (std_dev_multiplier * approx_std)
+    else:
+        threshold_val = 999999
+
+    mask_std = smoothed > threshold_val
+
+    # 4) Morphological opening => watershed => area filtering
+    opened = opening(mask_std, disk(3))
+    distance = ndi.distance_transform_edt(opened)
     local_maxi_coords = feature.peak_local_max(
-        data_dict['smoothed'],
-        min_distance=min_distance,
-        labels=data_dict['opened']
+        smoothed, min_distance=min_distance, labels=opened
     )
-    local_maxi = np.zeros_like(data_dict['opened'], dtype=bool)
+    local_maxi = np.zeros_like(opened, dtype=bool)
     local_maxi[tuple(local_maxi_coords.T)] = True
 
     markers = ndi.label(local_maxi)[0]
-    labels = segmentation.watershed(-distance, markers, mask=data_dict['opened'])
+    labels_ws = segmentation.watershed(-distance, markers, mask=opened)
 
-    # 5) Filter by area
-    final_mask = np.zeros_like(labels, dtype=bool)
-    for region in measure.regionprops(labels):
+    final_mask = np.zeros_like(labels_ws, dtype=bool)
+    for region in measure.regionprops(labels_ws):
         if region.area >= min_size:
             final_mask[tuple(region.coords.T)] = True
+
+    # Exclude saturated
+    final_mask[exclude_mask] = True
+
+    # ===== DEBUG OUTPUTS =====
+    if debug:
+        print("[DEBUG] =============== find_foci DEBUG (No Otsu) ===============")
+        print(f"[DEBUG] median_val={median_val:.2f}, MAD={mad_val:.2f}, "
+              f"threshold_val={threshold_val:.2f}")
+
+        fig, axs = plt.subplots(2, 3, figsize=(16, 8))
+        axs = axs.ravel()
+
+        # Panel 0: Original + saturated overlay
+        axs[0].imshow(original, cmap='gray')
+        axs[0].set_title("Raw Input")
+        axs[0].axis('off')
+        if remove_saturated and np.any(exclude_mask):
+            sat_overlay = np.zeros((*original.shape, 3), dtype=np.uint8)
+            sat_overlay[exclude_mask, 0] = 255  # color saturated in red
+            axs[0].imshow(sat_overlay, alpha=0.4)
+
+        # Panel 1: Smoothed
+        axs[1].imshow(smoothed, cmap='gray')
+        axs[1].set_title(f"Smoothed (sigma={sigma})")
+        axs[1].axis('off')
+
+        # Panel 2: mask_std
+        axs[2].imshow(mask_std, cmap='gray')
+        axs[2].set_title(f"mask_std > {threshold_val:.1f}")
+        axs[2].axis('off')
+
+        # Panel 3: opened
+        axs[3].imshow(opened, cmap='gray')
+        axs[3].set_title("After Opening")
+        axs[3].axis('off')
+
+        # Panel 4: local maxima
+        local_show = np.dstack([opened*255, opened*255, opened*255]).astype(np.uint8)
+        # Mark local maxima in green
+        local_show[local_maxi, 1] = 255
+        axs[4].imshow(local_show)
+        axs[4].set_title("Local Maxima (green)")
+        axs[4].axis('off')
+
+        # Panel 5: watershed + final
+        labeled_overlay = np.zeros((*final_mask.shape, 3), dtype=np.uint8)
+        rng = np.random.default_rng(1234)
+        for region in measure.regionprops(labels_ws):
+            color = rng.integers(0, 255, size=3)
+            for rr, cc in region.coords:
+                labeled_overlay[rr, cc] = color
+        labeled_overlay[~final_mask] //= 4
+        axs[5].imshow(labeled_overlay)
+        axs[5].set_title(f"Watershed + Filtered (min_size={min_size})")
+        axs[5].axis('off')
+
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
 
     return final_mask
 
@@ -729,11 +867,12 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
     bg_mask = (ratio_map < 0)
     ratio_rgb[bg_mask] = [0, 0, 0]
 
-    plt.figure(figsize=(6, 6))
+    fig = plt.figure(figsize=(6, 6))
     plt.imshow(ratio_rgb)
     plt.title("Droplet Ratio Map (2930 / 2850)")
     plt.axis('off')
     plt.show()
+    plt.close(fig)
 
     ratio_bgr = cv2.cvtColor(ratio_rgb, cv2.COLOR_RGB2BGR)
     out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
@@ -790,6 +929,7 @@ def visualize_hyperspectral_mask_overlay(cars_image, lipid_mask):
     axs[2].axis('off')
 
     plt.show()
+    plt.close(fig)
 
 
 def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
@@ -935,7 +1075,7 @@ def generate_reference_image(reference_file, output_path, blur_radius_microns):
         )
 
     normalized_reference = blurred_reference_scaled / max_value
-    imwrite(output_path, (normalized_reference * 255).astype(np.uint8))
+    imwrite(output_path, normalized_reference.astype(np.float32))
     print(f"Reference image saved to {output_path}")
 
     return normalized_reference
@@ -997,6 +1137,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
         Summary of lipid objects per cell from each marker.
     """
     foci_params = config["morphology_params"]["foci_params"]
+    fluorescence_params = config["morphology_params"]["fluorescence_params"]
 
     # Identify which marker is in this filename (for analysis display)
     analysis_marker_hit = None
@@ -1040,24 +1181,66 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
         cars_nd2.iter_axes = 'v'
         pixel_size_microns = fluoro_nd2.metadata['pixel_microns']
 
-        def max_project_cars(nd2obj, c_index, position):
+        def max_project_cars(
+            nd2obj,
+            c_index,
+            position,
+            reference_image,
+            foci_params
+        ):
             """Read z-slices from channel c_index, apply East-shadows, do max-projection."""
+            
+            # Extract the blur sigma from foci_params
+            gaussian_sigma = foci_params.get("sigma")
+    
             z_stack_slices_cars = []
-            for z_slice in range(nd2obj.sizes['z']):
-                raw_sl = np.nan_to_num(nd2obj.get_frame_2D(v=position, c=c_index, z=z_slice))
-                correlated_sl = apply_east_shadows_filter(raw_sl)
-                z_stack_slices_cars.append(correlated_sl)
-            return np.max(np.array(z_stack_slices_cars), axis=0)
-
-        def max_project_channel(nd2obj, ch_idx, position):
-            """Read z-slices from ch_idx, do max-projection."""
-            z_stack_slices_fl = []
-            for z_slice in range(nd2obj.sizes['z']):
-                raw_fl = np.nan_to_num(
-                    nd2obj.get_frame_2D(v=position, c=ch_idx, z=z_slice)
+            total_z = nd2obj.sizes.get('z', 1)
+        
+            for z_slice in range(total_z):
+                raw_sl = np.nan_to_num(
+                    nd2obj.get_frame_2D(v=position, c=c_index, z=z_slice)
                 )
-                z_stack_slices_fl.append(raw_fl)
-            return np.max(np.array(z_stack_slices_fl), axis=0)
+                # 1) East shadows filter
+                correlated_sl = apply_east_shadows_filter(raw_sl)
+        
+                # 2) Divide by reference
+                slice_div = np.nan_to_num(correlated_sl / reference_image)
+        
+                # 3) Gaussian blur
+                blurred_sl = gaussian(slice_div, sigma=gaussian_sigma, preserve_range=True)
+        
+                z_stack_slices_cars.append(blurred_sl)
+        
+            # 4) Finally, take maximum-intensity projection across Z
+            final_mip = np.max(np.array(z_stack_slices_cars), axis=0)
+            return final_mip
+
+        def max_project_fluorescence(nd2obj, ch_index, position, fluoro_params):
+            """
+            Read each Z-slice from a fluorescence channel, apply an optional Gaussian blur
+            (sigma>0), then return a maximum-intensity projection.
+            """
+            z_stack_slices = []
+            total_z = nd2obj.sizes.get('z', 1)
+        
+            # Pull the sigma (or default to 0 => skip blur)
+            gaussian_sigma = fluoro_params.get("gaussian_sigma", 0.0)
+        
+            for z_slice in range(total_z):
+                raw_slice = nd2obj.get_frame_2D(v=position, c=ch_index, z=z_slice)
+                raw_slice = np.nan_to_num(raw_slice)
+        
+                # If sigma>0, apply a blur to this slice before storing it
+                if gaussian_sigma > 0:
+                    blurred_slice = gaussian(raw_slice, sigma=gaussian_sigma, preserve_range=True)
+                    z_stack_slices.append(blurred_slice)
+                else:
+                    # No blur
+                    z_stack_slices.append(raw_slice)
+        
+            # Finally, do a max projection of the slice stack
+            final_mip = np.max(np.array(z_stack_slices), axis=0)
+            return final_mip
 
         for pos in range(fluoro_nd2.sizes['v']):
             fluoro_nd2.default_coords['v'] = pos
@@ -1070,22 +1253,28 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
             dapi_ch_idx = config["channel_map"].get("DAPI", None)
             if dapi_ch_idx is not None:
-                z_stack_slices_dapi = []
-                for z_idx in range(fluoro_nd2.sizes['z']):
-                    raw_dapi = np.nan_to_num(
-                        fluoro_nd2.get_frame_2D(v=pos, c=dapi_ch_idx, z=z_idx)
-                    )
-                    z_stack_slices_dapi.append(raw_dapi)
-                dapi_slice = np.max(np.array(z_stack_slices_dapi), axis=0)
-
-                dapi_mask = process_fluorescence_channel(
-                    dapi_slice, **config["morphology_params"]["nuclei_params"]
+                dapi_slice = max_project_fluorescence(
+                    nd2obj=fluoro_nd2,
+                    ch_index=dapi_ch_idx,
+                    position=pos,
+                    fluoro_params=config["morphology_params"]["nuclei_params"]
                 )
+            
+                dapi_mask = process_fluorescence_channel(
+                    dapi_slice,
+                    **config["morphology_params"]["nuclei_params"]
+                )
+                debug_display_dapi(dapi_slice, dapi_mask, pos)
             else:
                 dapi_mask = None
 
-            cars_slice = max_project_cars(cars_nd2, 2, pos)
-            corrected_cars_slice = np.nan_to_num(cars_slice / reference_image)
+            corrected_cars_slice = max_project_cars(
+                nd2obj=cars_nd2,
+                c_index=2,
+                position=pos,
+                reference_image=reference_image,
+                foci_params=foci_params
+            )
 
             fluor_images_for_display = {}
             for cm in chosen_cell_markers:
@@ -1122,6 +1311,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             axs[1].set_title(f"Max Projected CARS (pos={pos+1})")
             axs[1].axis('off')
             plt.show()
+            plt.close(fig)
 
             cars_foci_mask = find_foci(corrected_cars_slice, **foci_params)
 
@@ -1130,27 +1320,32 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     cm_channel_idx = channel_map.get(cm, None)
                     if cm_channel_idx is None:
                         continue
-                    cm_slice = max_project_channel(fluoro_nd2, cm_channel_idx, pos)
+                    cm_slice = max_project_fluorescence(
+                        nd2obj=fluoro_nd2,
+                        ch_index=cm_channel_idx,
+                        position=pos,
+                        fluoro_params=fluorescence_params
+                    )
 
-                    base_fluor_params = config["morphology_params"]["fluorescence_params"]
                     marker_thresholds = config.get("marker_thresholds", {})
                     cm_thresholds = marker_thresholds.get(cm, {})
 
                     threshold_method = cm_thresholds.get(
                         "threshold_method",
-                        base_fluor_params.get("threshold_method", "otsu")
+                        fluorescence_params.get("threshold_method", "otsu")
                     )
                     offset_val = cm_thresholds.get(
                         "offset",
-                        base_fluor_params.get("offset", 1.0)
+                        fluorescence_params.get("offset", 1.0)
                     )
 
                     cm_mask = process_fluorescence_channel(
                         cm_slice,
-                        min_size=base_fluor_params["min_size"],
-                        closing_radius=base_fluor_params["closing_radius"],
-                        gaussian_sigma=base_fluor_params["gaussian_sigma"],
-                        fill_holes=base_fluor_params["fill_holes"],
+                        cell_size=fluorescence_params["cell_size"],
+                        min_size=fluorescence_params["min_size"],
+                        closing_radius=fluorescence_params["closing_radius"],
+                        gaussian_sigma=fluorescence_params["gaussian_sigma"],
+                        fill_holes=fluorescence_params["fill_holes"],
                         threshold_method=threshold_method,
                         offset=offset_val
                     )
@@ -1202,6 +1397,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     axs_mask[2].set_title(f"Overlay (pos={pos+1}) [{cm}]")
                     axs_mask[2].axis('off')
                     plt.show()
+                    plt.close(fig_mask)
 
                     if dapi_mask is not None:
                         images_dir = ensure_subdirectory(
@@ -1239,6 +1435,35 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
     return all_positions_results, all_positions_summary
 
 
+def debug_display_dapi(raw_dapi_slice, dapi_mask, pos_index):
+    """
+    Displays a quick debug figure of the DAPI slice vs. the final DAPI mask.
+    Shows how 'liberal' the mask is compared to the raw intensity.
+    """
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
+
+    axs[0].imshow(raw_dapi_slice, cmap='gray')
+    axs[0].set_title(f"DAPI (pos={pos_index+1}) - Max Projection")
+    axs[0].axis('off')
+
+    # We'll overlay the mask in red
+    overlay = np.dstack([raw_dapi_slice]*3).astype(np.float32)
+    # Normalize overlay for display
+    overlay = rescale_intensity(overlay, in_range='image', out_range=(0, 255)).astype(np.uint8)
+    mask_red = np.zeros_like(overlay)
+    mask_red[..., 0] = dapi_mask * 255  # fill red channel
+    alpha = 0.4
+
+    axs[1].imshow(overlay)
+    axs[1].imshow(mask_red, alpha=alpha)
+    axs[1].set_title(f"DAPI Mask Overlay (pos={pos_index+1})")
+    axs[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
 def save_results_to_excel(results, summary, output_file):
     """
     Save analysis results and summary to an Excel file.
@@ -1254,6 +1479,12 @@ def save_results_to_excel(results, summary, output_file):
     """
     results_df = pd.DataFrame(results)
     summary_df = pd.DataFrame(summary)
+
+    # If these columns exist, sort by them in order.
+    if 'cell_marker' in results_df.columns and 'z_stack' in results_df.columns:
+        results_df = results_df.sort_values(by=['file_name', 'cell_marker', 'z_stack'])
+    if 'cell_marker' in summary_df.columns and 'z_stack' in summary_df.columns:
+        summary_df = summary_df.sort_values(by=['file_name', 'cell_marker', 'z_stack'])
 
     with pd.ExcelWriter(output_file) as writer:
         results_df.to_excel(writer, sheet_name='Detailed Results', index=False)
@@ -1495,6 +1726,15 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
 
 
 if __name__ == "__main__":
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--config", required=True,
+    #                     help="Path to a .py file containing `config` dict.")
+    # args = parser.parse_args()
+
+    # config = load_config(args.config)
+    
+    from config_AD4d import config
+    
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')
     reference_output_path = os.path.join(DIRECTORY, 'Reference.tif')
@@ -1523,10 +1763,7 @@ if __name__ == "__main__":
         all_summary_list.extend(pair_sum)
 
     # 3) Process hyperspectral series
-    hyperspectral_foci_params = config["morphology_params"].get(
-        "foci_params_hyperspectral",
-        config["morphology_params"]["foci_params"]
-    )
+    hyperspectral_foci_params = config["morphology_params"]["foci_params_hyperspectral"]
     for folder in hyperspectral_folders:
         folder_name = os.path.basename(folder)
         hyperspectral_output = os.path.join(
