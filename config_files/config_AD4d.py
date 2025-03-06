@@ -1,7 +1,7 @@
 config = {
     "file_keywords": {
         "magnification_keyword": "100X",
-        "fluorescence_markers": ["DAPI", "TUJ", "LAMP2"],
+        "fluorescence_markers": ["DAPI", "TUJ", "LAMP2", "Autofluorescence"],
         "cars_keyword": "CARS2850",
         "stacks_keywords": ["Neurons"],
         "hyperspectral_keyword": "Spectrum"
@@ -15,15 +15,15 @@ config = {
     "cell_markers": ["IBA1", "TUJ"],
     "marker_thresholds": {
         "TUJ": {
-            "threshold_method": "yen",
-            "offset": 0.75
+            "threshold_method": "triangle",
+            "offset": 0.725
         }
     },
     "morphology_params": {
         "fluorescence_params": {
             "cell_size": 10000,
-            "min_size": 500,
-            "closing_radius": 10,
+            "min_size": 2000,
+            "closing_radius": 14,
             "gaussian_sigma": 2,
             "fill_holes": True,
             "threshold_method": "otsu",  # fallback
@@ -65,7 +65,7 @@ config = {
         "DEFAULT": (255, 255, 255)  # fallback color (white)
     },
     "paths": {
-        "data_directory": r"C:\Users\clchr\Downloads\AD4d",
+        "data_directory": r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD4d"
     },
     "stack_offset": {
         "DAPI": 0,

@@ -1726,14 +1726,14 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--config", required=True,
-    #                     help="Path to a .py file containing `config` dict.")
-    # args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True,
+                        help="Path to a .py file containing `config` dict.")
+    args = parser.parse_args()
 
-    # config = load_config(args.config)
+    config = load_config(args.config)
     
-    from config_AD4d import config
+    # from config_AD3d import config
     
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')

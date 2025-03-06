@@ -1,7 +1,7 @@
 config = {
     "file_keywords": {
         "magnification_keyword": "100X",
-        "fluorescence_markers": ["DAPI", "IBA1", "TUJ"],
+        "fluorescence_markers": ["DAPI", "IBA1", "TUJ", "Autofluorescence"],
         "cars_keyword": "CARS2850",
         "stacks_keywords": [""],
         "hyperspectral_keyword": "Spectrum"
@@ -16,24 +16,26 @@ config = {
     "marker_thresholds": {
         "IBA1": {
             "threshold_method": "triangle",
-            "offset": 0.95
+            "offset": 0.9
         },
         "TUJ": {
             "threshold_method": "triangle",
-            "offset": 0.85
+            "offset": 0.725
         }
     },
     "morphology_params": {
         "fluorescence_params": {
-            "min_size": 10000,
-            "closing_radius": 8,
+            "cell_size": 10000,
+            "min_size": 2000,
+            "closing_radius": 14,
             "gaussian_sigma": 2,
             "fill_holes": True,
             "threshold_method": "otsu",  # fallback
             "offset": 1.0               # fallback
         },
         "nuclei_params": {
-            "min_size": 5000,
+            "cell_size": 5000,
+            "min_size": 1000,
             "closing_radius": 3,
             "gaussian_sigma": 2,
             "fill_holes": True,
@@ -67,7 +69,7 @@ config = {
         "DEFAULT": (255, 255, 255)  # fallback color (white)
     },
     "paths": {
-        "data_directory": r"C:\Users\clchr\Downloads\AD4c",
+        "data_directory": r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD4c"
     },
     "stack_offset": {
         "DAPI": 0,
