@@ -59,6 +59,15 @@ config = {
             "remove_saturated": False,
             "saturation_threshold": 2500,
             "saturated_min_size": 5000
+        },
+        "autofluorescence_params": {
+            "sigma": 2,
+            "min_distance": 15,
+            "min_size": 35,
+            "std_dev_multiplier": 3,
+            "remove_saturated": True,
+            "saturation_threshold": 2500,
+            "saturated_min_size": 5000
         }
     },
     "colormaps": {

@@ -61,12 +61,13 @@ config = {
             "saturated_min_size": 5000
         },
         "autofluorescence_params": {
+            "sigma": 2,
+            "min_distance": 15,
             "min_size": 35,
-            "closing_radius": 1,
-            "gaussian_sigma": 2,
-            "fill_holes": True,
-            "threshold_method": "triangle",
-            "offset": 1.0
+            "std_dev_multiplier": 3,
+            "remove_saturated": True,
+            "saturation_threshold": 2500,
+            "saturated_min_size": 5000
         }
     },
     "colormaps": {

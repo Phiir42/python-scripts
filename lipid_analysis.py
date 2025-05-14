@@ -12,7 +12,7 @@ using:
 Main steps:
 -----------
 1. Reference image generation:
-   - A reference ND2 file is opened and used to create a normalized reference TIFF.
+   - A reference .nd2 file is opened and used to create a normalized reference .tif.
 
 2. File pairing and offset logic:
    - The script identifies fluorescence vs. CARS .nd2 files (based on config-defined
@@ -27,8 +27,8 @@ Main steps:
      each cell.
 
 4. Hyperspectral analysis (if applicable):
-   - Folders containing hyperspectral data are detected, and each ND2 in the folder is
-     processed to build a series of corrected images and measure lipid intensities
+   - Folders containing hyperspectral data are detected, and each .nd2 file in the folder
+     is processed to build a series of corrected images and measure lipid intensities
      across different wavenumbers.
 
 5. Results output:
@@ -247,7 +247,8 @@ def match_fluoro_and_cars(fluoro_list, cars_list, config):
                 f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}"
                 f"{f_stacks_num or ''}"
             )
-            c_markers_sorted = "-".join(sorted(list(c_cars_markers))) or "NoMarkers"
+            c_markers_sorted = "-".join(sorted(list(c_cars_markers))
+                                        ) or "NoMarkers"
             pair_key = (
                 f"{f_meta['prefix']}-Stacks{f_meta['stacks_label']}"
                 f"{f_stacks_num or ''}-{c_markers_sorted}"
@@ -485,7 +486,8 @@ def process_fluorescence_channel(
         If input slice is not 2D.
     """
     if image_slice.ndim != 2:
-        raise ValueError(f"Expected a 2D array, but got shape {image_slice.shape}")
+        raise ValueError(f"Expected a 2D array, but got shape {
+                         image_slice.shape}")
 
     image_slice = np.nan_to_num(image_slice)
 
@@ -516,12 +518,12 @@ def process_fluorescence_channel(
         else:
             base_threshold = threshold_otsu(valid_pixels)
     else:
-        base_threshold = 999999;
+        base_threshold = 999999
 
     final_threshold = base_threshold * offset
     binary_mask = image_slice > final_threshold
     binary_mask[exclude_mask] = False
-    
+
     cleaned_mask = remove_small_objects(binary_mask, min_size=min_size)
 
     binary_closed = closing(cleaned_mask, disk(closing_radius))
@@ -529,7 +531,7 @@ def process_fluorescence_channel(
         binary_closed = ndi.binary_fill_holes(binary_closed)
 
     cell_mask = remove_small_objects(binary_closed, min_size=cell_size)
-    
+
     # =========== DEBUG PLOTS IF DESIRED ================
     if debug:
         fig, axes = plt.subplots(1, 5, figsize=(20, 4))
@@ -545,17 +547,18 @@ def process_fluorescence_channel(
 
         axes[3].imshow(binary_closed, cmap='gray')
         axes[3].set_title("After Closing + Fill")
-        
+
         axes[4].imshow(cell_mask, cmap='gray')
         axes[4].set_title("Final Cleaned Mask")
 
         for ax in axes:
             ax.axis('off')
-        plt.suptitle(f"Method: {threshold_method}, offset={offset:.2f}, closing={closing_radius}")
+        plt.suptitle(f"Method: {threshold_method}, offset={
+                     offset:.2f}, closing={closing_radius}")
         plt.tight_layout()
         plt.show()
     # ====================================================
-    
+
     return cell_mask
 
 
@@ -629,7 +632,8 @@ def find_foci(
         preliminary_sat_mask = image_slice > saturation_threshold
         labeled_sat = measure.label(preliminary_sat_mask)
         if debug:
-            print(f"[DEBUG] Checking for saturated objects above {saturation_threshold}...")
+            print(f"[DEBUG] Checking for saturated objects above {
+                  saturation_threshold}...")
 
         for region in measure.regionprops(labeled_sat):
             if region.area >= saturated_min_size:
@@ -638,7 +642,8 @@ def find_foci(
 
         if debug:
             sat_count = np.count_nonzero(exclude_mask)
-            print(f"[DEBUG] Excluding {sat_count} pixels from saturated regions.")
+            print(f"[DEBUG] Excluding {
+                  sat_count} pixels from saturated regions.")
 
     # 2) Optional smoothing
     if sigma > 0:
@@ -714,7 +719,8 @@ def find_foci(
         axs[3].axis('off')
 
         # Panel 4: local maxima
-        local_show = np.dstack([opened*255, opened*255, opened*255]).astype(np.uint8)
+        local_show = np.dstack(
+            [opened*255, opened*255, opened*255]).astype(np.uint8)
         # Mark local maxima in green
         local_show[local_maxi, 1] = 255
         axs[4].imshow(local_show)
@@ -803,7 +809,8 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
         lipid_id = lipid.label
         intensities = []
         for img in corrected_images:
-            mean_intensity = np.mean(img[lipid.coords[:, 0], lipid.coords[:, 1]])
+            mean_intensity = np.mean(
+                img[lipid.coords[:, 0], lipid.coords[:, 1]])
             intensities.append(mean_intensity)
         lipid_data.append([lipid_id] + intensities)
 
@@ -826,7 +833,8 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
 
     with pd.ExcelWriter(output_path) as writer:
         lipid_df_raw.to_excel(writer, sheet_name='Raw Data', index=False)
-        lipid_df_norm.to_excel(writer, sheet_name='Normalized Data', index=False)
+        lipid_df_norm.to_excel(
+            writer, sheet_name='Normalized Data', index=False)
 
     print(f"Hyperspectral lipid intensities saved to {output_path}")
 
@@ -932,39 +940,23 @@ def visualize_hyperspectral_mask_overlay(cars_image, lipid_mask):
     plt.close(fig)
 
 
-def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
-                                  file_name, z_stack, pixel_size_microns):
+def analyze_3way_intracellular_objects(
+    labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo,
+    cell_mask,
+    cars_image,
+    auto_image,
+    file_name,
+    z_stack,
+    pixel_size_microns
+):
     """
-    Analyze lipid inclusions within each cell in the image.
-
-    1) Labels cells from cell_mask, labels lipids from cars_mask.
-    2) For each cell region, compute area, lipid objects in that region, etc.
-    3) Summarizes lipid size, intensity, and proportion for each cell.
-
-    Parameters
-    ----------
-    cars_mask : ndarray (bool)
-        Mask for CARS lipid droplets.
-    cell_mask : ndarray (bool)
-        Mask for cells.
-    cars_image : ndarray
-        Original (or corrected) CARS image.
-    file_name : str
-        Name of the .nd2 file being processed.
-    z_stack : int
-        Current z-stack index being analyzed.
-    pixel_size_microns : float
-        Pixel size in microns.
-
-    Returns
-    -------
-    results : list of dict
-        Detailed results of lipid inclusions for each cell-lipid object pair.
-    summary : list of dict
-        One-row summary per cell, indicating total lipid count and area fraction.
+    Analyze 3 categories of objects inside each cell:
+      1) pure_lipid         -> labeled_pure_lipid
+      2) lipid_lipofuscin   -> labeled_lipo_lipid
+      3) pure_lipofuscin    -> labeled_pure_lipo
+    Returns two lists: (results, summary)
     """
     labeled_cells = measure.label(cell_mask)
-    labeled_lipids = measure.label(cars_mask)
     results = []
     summary = []
 
@@ -972,20 +964,18 @@ def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
         cell_id = cell.label
         cell_area = cell.area
         cell_area_um2 = cell_area * (pixel_size_microns ** 2)
-
         cell_mask_region = (labeled_cells == cell_id)
-        lipid_objects_in_cell = labeled_lipids * cell_mask_region
 
-        lipid_count = 0
-        total_lipid_area = 0.0
+        # A) measure pure_lipid inside cell
+        pure_lipid_in_cell = labeled_pure_lipid * cell_mask_region
+        pure_lipid_count = 0
+        pure_lipid_area_um2 = 0.0
 
-        for lipid in measure.regionprops(
-            lipid_objects_in_cell, intensity_image=cars_image
-        ):
-            lipid_size_pixels = lipid.area
-            lipid_size_um2 = lipid_size_pixels * (pixel_size_microns ** 2)
-            lipid_count += 1
-            total_lipid_area += lipid_size_um2
+        for region_lipid in measure.regionprops(pure_lipid_in_cell, intensity_image=cars_image):
+            area_px = region_lipid.area
+            area_um2 = area_px * (pixel_size_microns**2)
+            pure_lipid_count += 1
+            pure_lipid_area_um2 += area_um2
 
             results.append({
                 'file_name': file_name,
@@ -993,15 +983,67 @@ def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
                 'cell_id': cell_id,
                 'cell_area': cell_area,
                 'cell_area_um2': cell_area_um2,
-                'lipid_size_pixels': lipid_size_pixels,
-                'lipid_size_um2': lipid_size_um2,
-                'lipid_intensity': lipid.mean_intensity
+                'feature_type': "pure_lipid",
+                'feature_size_pixels': area_px,
+                'feature_size_um2': area_um2,
+                'feature_intensity': region_lipid.mean_intensity
             })
 
+        # B) measure lipid_lipofuscin inside cell
+        lipo_lipid_in_cell = labeled_lipo_lipid * cell_mask_region
+        lipid_lipo_count = 0
+        lipid_lipo_area_um2 = 0.0
+
+        for region_ll in measure.regionprops(lipo_lipid_in_cell, intensity_image=cars_image):
+            area_px = region_ll.area
+            area_um2 = area_px * (pixel_size_microns**2)
+            lipid_lipo_count += 1
+            lipid_lipo_area_um2 += area_um2
+
+            results.append({
+                'file_name': file_name,
+                'z_stack': z_stack,
+                'cell_id': cell_id,
+                'cell_area': cell_area,
+                'cell_area_um2': cell_area_um2,
+                'feature_type': "lipid_lipofuscin",
+                'feature_size_pixels': area_px,
+                'feature_size_um2': area_um2,
+                'feature_intensity': region_ll.mean_intensity
+            })
+
+        # C) measure pure_lipofuscin inside cell
+        pure_lipo_in_cell = labeled_pure_lipo * cell_mask_region
+        pure_lipo_count = 0
+        pure_lipo_area_um2 = 0.0
+
+        for region_pure_l in measure.regionprops(pure_lipo_in_cell, intensity_image=auto_image):
+            area_px = region_pure_l.area
+            area_um2 = area_px * (pixel_size_microns**2)
+            pure_lipo_count += 1
+            pure_lipo_area_um2 += area_um2
+
+            results.append({
+                'file_name': file_name,
+                'z_stack': z_stack,
+                'cell_id': cell_id,
+                'cell_area': cell_area,
+                'cell_area_um2': cell_area_um2,
+                'feature_type': "pure_lipofuscin",
+                'feature_size_pixels': area_px,
+                'feature_size_um2': area_um2,
+                'feature_intensity': region_pure_l.mean_intensity
+            })
+
+        # Summaries
         if cell_area_um2 > 0:
-            lipid_percentage = (total_lipid_area / cell_area_um2) * 100.0
+            pure_lipid_pct = 100.0 * (pure_lipid_area_um2 / cell_area_um2)
+            lipid_lipo_pct = 100.0 * (lipid_lipo_area_um2 / cell_area_um2)
+            pure_lipo_pct = 100.0 * (pure_lipo_area_um2 / cell_area_um2)
         else:
-            lipid_percentage = 0.0
+            pure_lipid_pct = 0
+            lipid_lipo_pct = 0
+            pure_lipo_pct = 0
 
         summary.append({
             'file_name': file_name,
@@ -1009,9 +1051,18 @@ def analyze_intracellular_objects(cars_mask, cell_mask, cars_image,
             'cell_id': cell_id,
             'cell_area': cell_area,
             'cell_area_um2': cell_area_um2,
-            'lipid_count': lipid_count,
-            'total_lipid_area_um2': total_lipid_area,
-            'lipid_percentage': lipid_percentage
+
+            'pure_lipid_count': pure_lipid_count,
+            'pure_lipid_area_um2': pure_lipid_area_um2,
+            'pure_lipid_percentage': pure_lipid_pct,
+
+            'lipid_lipofuscin_count': lipid_lipo_count,
+            'lipid_lipofuscin_area_um2': lipid_lipo_area_um2,
+            'lipid_lipofuscin_percentage': lipid_lipo_pct,
+
+            'lipofuscin_count': pure_lipo_count,
+            'lipofuscin_area_um2': pure_lipo_area_um2,
+            'lipofuscin_percentage': pure_lipo_pct
         })
 
     return results, summary
@@ -1067,7 +1118,8 @@ def generate_reference_image(reference_file, output_path, blur_radius_microns):
     if blurred_ref_max <= 0:
         raise ValueError("Blurred reference has no valid data.")
 
-    blurred_reference_scaled = blurred_reference * (original_max / blurred_ref_max)
+    blurred_reference_scaled = blurred_reference * \
+        (original_max / blurred_ref_max)
     max_value = np.max(blurred_reference_scaled)
     if max_value <= 0:
         raise ValueError(
@@ -1138,6 +1190,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
     """
     foci_params = config["morphology_params"]["foci_params"]
     fluorescence_params = config["morphology_params"]["fluorescence_params"]
+    autofluorescence_params = config["morphology_params"]["autofluorescence_params"]
 
     # Identify which marker is in this filename (for analysis display)
     analysis_marker_hit = None
@@ -1167,10 +1220,12 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
     cell_marker_map = config.get("cell_marker_map", {})
     if stacks_label in cell_marker_map:
         chosen_cell_markers = cell_marker_map[stacks_label]
-        print(f"Using custom marker set for '{stacks_label}': {chosen_cell_markers}")
+        print(f"Using custom marker set for '{
+              stacks_label}': {chosen_cell_markers}")
     else:
         chosen_cell_markers = config.get("cell_markers", [])
-        print(f"No custom marker map for '{stacks_label}', using: {chosen_cell_markers}")
+        print(f"No custom marker map for '{
+              stacks_label}', using: {chosen_cell_markers}")
 
     all_positions_results = []
     all_positions_summary = []
@@ -1189,28 +1244,29 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             foci_params
         ):
             """Read z-slices from channel c_index, apply East-shadows, do max-projection."""
-            
+
             # Extract the blur sigma from foci_params
             gaussian_sigma = foci_params.get("sigma")
-    
+
             z_stack_slices_cars = []
             total_z = nd2obj.sizes.get('z', 1)
-        
+
             for z_slice in range(total_z):
                 raw_sl = np.nan_to_num(
                     nd2obj.get_frame_2D(v=position, c=c_index, z=z_slice)
                 )
                 # 1) East shadows filter
                 correlated_sl = apply_east_shadows_filter(raw_sl)
-        
+
                 # 2) Divide by reference
                 slice_div = np.nan_to_num(correlated_sl / reference_image)
-        
+
                 # 3) Gaussian blur
-                blurred_sl = gaussian(slice_div, sigma=gaussian_sigma, preserve_range=True)
-        
+                blurred_sl = gaussian(
+                    slice_div, sigma=gaussian_sigma, preserve_range=True)
+
                 z_stack_slices_cars.append(blurred_sl)
-        
+
             # 4) Finally, take maximum-intensity projection across Z
             final_mip = np.max(np.array(z_stack_slices_cars), axis=0)
             return final_mip
@@ -1222,22 +1278,24 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             """
             z_stack_slices = []
             total_z = nd2obj.sizes.get('z', 1)
-        
+
             # Pull the sigma (or default to 0 => skip blur)
             gaussian_sigma = fluoro_params.get("gaussian_sigma", 0.0)
-        
+
             for z_slice in range(total_z):
-                raw_slice = nd2obj.get_frame_2D(v=position, c=ch_index, z=z_slice)
+                raw_slice = nd2obj.get_frame_2D(
+                    v=position, c=ch_index, z=z_slice)
                 raw_slice = np.nan_to_num(raw_slice)
-        
+
                 # If sigma>0, apply a blur to this slice before storing it
                 if gaussian_sigma > 0:
-                    blurred_slice = gaussian(raw_slice, sigma=gaussian_sigma, preserve_range=True)
+                    blurred_slice = gaussian(
+                        raw_slice, sigma=gaussian_sigma, preserve_range=True)
                     z_stack_slices.append(blurred_slice)
                 else:
                     # No blur
                     z_stack_slices.append(raw_slice)
-        
+
             # Finally, do a max projection of the slice stack
             final_mip = np.max(np.array(z_stack_slices), axis=0)
             return final_mip
@@ -1259,7 +1317,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     position=pos,
                     fluoro_params=config["morphology_params"]["nuclei_params"]
                 )
-            
+
                 dapi_mask = process_fluorescence_channel(
                     dapi_slice,
                     **config["morphology_params"]["nuclei_params"]
@@ -1282,9 +1340,10 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     ch_idx = channel_map.get(cm, None)
                     if ch_idx is not None:
                         z_stack_fl = []
-                        for z_idx in range(fluoro_nd2.sizes['z']):
+                        for z_idx in range(fluoro_nd2.sizes.get('z', 1)):
                             raw_slice = np.nan_to_num(
-                                fluoro_nd2.get_frame_2D(v=pos, c=ch_idx, z=z_idx)
+                                fluoro_nd2.get_frame_2D(
+                                    v=pos, c=ch_idx, z=z_idx)
                             )
                             z_stack_fl.append(raw_slice)
                         fluor_images_for_display[cm] = np.max(
@@ -1292,7 +1351,8 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         )
 
             if len(fluor_images_for_display) > 0:
-                composite_fluor = composite_fluorescence(fluor_images_for_display, config)
+                composite_fluor = composite_fluorescence(
+                    fluor_images_for_display, config)
             else:
                 composite_fluor = np.zeros(
                     (
@@ -1304,7 +1364,8 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
             fig, axs = plt.subplots(1, 2, figsize=(10, 5))
             axs[0].imshow(composite_fluor)
-            axs[0].set_title(f"Max Projected Fluorescence Overlay (pos={pos+1})")
+            axs[0].set_title(
+                f"Max Projected Fluorescence Overlay (pos={pos+1})")
             axs[0].axis('off')
 
             axs[1].imshow(corrected_cars_slice, cmap='gray')
@@ -1312,8 +1373,36 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             axs[1].axis('off')
             plt.show()
             plt.close(fig)
+            
+            from myelin_analysis import detect_myelin
+            myelin_mask, myelin_pct = detect_myelin(corrected_cars_slice,
+                                         gaussian_sigma=1.0,
+                                         offset=0.9,
+                                         min_size=300,
+                                         closing_radius=1,
+                                         debug=True)
 
             cars_foci_mask = find_foci(corrected_cars_slice, **foci_params)
+
+            auto_ch_idx = config["channel_map"].get("Autofluorescence", None)
+            auto_slice = max_project_fluorescence(
+                nd2obj=fluoro_nd2,
+                ch_index=auto_ch_idx,
+                position=pos,
+                # define or reuse
+                fluoro_params=config["morphology_params"]["autofluorescence_params"]
+            )
+            auto_mask = find_foci(auto_slice, **autofluorescence_params)
+
+            # 1) Build three pixel-level masks
+            pure_lipid_mask = cars_foci_mask & ~auto_mask
+            lipid_lipofuscin_mask = cars_foci_mask & auto_mask
+            pure_lipofuscin_mask = auto_mask & ~cars_foci_mask
+
+            # 2) Label each one separately
+            labeled_pure_lipid = measure.label(pure_lipid_mask)
+            labeled_lipo_lipid = measure.label(lipid_lipofuscin_mask)
+            labeled_pure_lipo = measure.label(pure_lipofuscin_mask)
 
             for cm in chosen_cell_markers:
                 if cm in fluorescence_path:
@@ -1350,10 +1439,24 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         offset=offset_val
                     )
 
-                    pos_results, pos_summary = analyze_intracellular_objects(
-                        cars_foci_mask,
+                    debug_display_3way_segmentation(
+                        pure_lipid_mask,
+                        lipid_lipofuscin_mask,
+                        pure_lipofuscin_mask,
+                        cm_mask,
+                        auto_image=auto_slice,
+                        cars_image=corrected_cars_slice,
+                        pos_index=pos,
+                        title_suffix=f"[{cm}]"
+                    )
+
+                    pos_results, pos_summary = analyze_3way_intracellular_objects(
+                        labeled_pure_lipid,
+                        labeled_lipo_lipid,
+                        labeled_pure_lipo,
                         cm_mask,
                         corrected_cars_slice,
+                        auto_slice,
                         file_name=os.path.basename(fluorescence_path),
                         z_stack=pos + 1,
                         pixel_size_microns=pixel_size_microns
@@ -1363,6 +1466,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         r_item["cell_marker"] = cm
                     for s_item in pos_summary:
                         s_item["cell_marker"] = cm
+                        s_item["myelination_percentage"] = myelin_pct
 
                     all_positions_results.extend(pos_results)
                     all_positions_summary.extend(pos_summary)
@@ -1416,7 +1520,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                 if ch_idx is None:
                     continue
                 z_stack_fl = []
-                for z_slice in range(fluoro_nd2.sizes['z']):
+                for z_slice in range(fluoro_nd2.sizes.get('z', 1)):
                     raw_slice_fluor = np.nan_to_num(
                         fluoro_nd2.get_frame_2D(v=pos, c=ch_idx, z=z_slice)
                     )
@@ -1449,7 +1553,8 @@ def debug_display_dapi(raw_dapi_slice, dapi_mask, pos_index):
     # We'll overlay the mask in red
     overlay = np.dstack([raw_dapi_slice]*3).astype(np.float32)
     # Normalize overlay for display
-    overlay = rescale_intensity(overlay, in_range='image', out_range=(0, 255)).astype(np.uint8)
+    overlay = rescale_intensity(
+        overlay, in_range='image', out_range=(0, 255)).astype(np.uint8)
     mask_red = np.zeros_like(overlay)
     mask_red[..., 0] = dapi_mask * 255  # fill red channel
     alpha = 0.4
@@ -1458,6 +1563,122 @@ def debug_display_dapi(raw_dapi_slice, dapi_mask, pos_index):
     axs[1].imshow(mask_red, alpha=alpha)
     axs[1].set_title(f"DAPI Mask Overlay (pos={pos_index+1})")
     axs[1].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    plt.close(fig)
+
+
+def debug_display_3way_segmentation(
+    pure_lipid_mask,
+    lipid_lipofuscin_mask,
+    pure_lipofuscin_mask,
+    cell_mask,
+    auto_image=None,         # raw autofluorescence max-projection
+    cars_image=None,         # raw CARS max-projection
+    pos_index=0,
+    title_suffix=""
+):
+    """
+    Debug display showing:
+      Row 1:
+        [0] Raw Autofluorescence
+        [1] Raw CARS
+        [2] Cell Mask
+        [3] Composite Overlay (all 4)
+      Row 2:
+        [0] Pure Lipid Mask
+        [1] Lipid+Lipofuscin Mask
+        [2] Pure Lipofuscin Mask
+        [3] (unused or second overlay)
+    """
+
+    # 1) Convert raw images to 8-bit for display
+    def autoscale_grayscale(img_2d):
+        if img_2d is None:
+            return None
+        scaled = rescale_intensity(
+            img_2d, in_range='image', out_range=(0, 255))
+        return scaled.astype(np.uint8)
+
+    auto_8bit = autoscale_grayscale(auto_image)
+    cars_8bit = autoscale_grayscale(cars_image)
+
+    # 2) Create color-coded versions of each mask
+    def make_rgb_mask(mask, rgb_color):
+        """mask: bool array, rgb_color: (R,G,B) in [0..255]."""
+        rgb_img = np.zeros((*mask.shape, 3), dtype=np.uint8)
+        for i in range(3):
+            rgb_img[..., i] = mask * rgb_color[i]
+        return rgb_img
+
+    # Pick your own colors:
+    #   pure lipid          = green
+    #   lipid+lipofuscin   = red
+    #   pure lipofuscin    = magenta
+    #   cell mask          = blue
+    pure_lipid_rgb = make_rgb_mask(pure_lipid_mask, (0, 255, 0))
+    lipid_lipofuscin_rgb = make_rgb_mask(lipid_lipofuscin_mask, (255, 0, 0))
+    pure_lipofuscin_rgb = make_rgb_mask(pure_lipofuscin_mask, (255, 0, 255))
+    cell_rgb = make_rgb_mask(cell_mask, (0, 0, 255))
+
+    # 3) Build an overlay.  Adjust these alpha factors as you like.
+    overlay_float = (
+        0.5 * pure_lipid_rgb.astype(np.float32)
+        + 0.5 * lipid_lipofuscin_rgb.astype(np.float32)
+        + 0.5 * pure_lipofuscin_rgb.astype(np.float32)
+        + 0.3 * cell_rgb.astype(np.float32)
+    )
+    overlay_rgb = np.clip(overlay_float, 0, 255).astype(np.uint8)
+
+    # 4) Plot everything in a 2x4 grid
+    fig, axs = plt.subplots(2, 4, figsize=(18, 9))
+
+    # Row 1
+    # a) Raw autofluorescence
+    if auto_8bit is not None:
+        axs[0, 0].imshow(auto_8bit, cmap='gray')
+        axs[0, 0].set_title(f"Autofluorescence (pos={pos_index+1})")
+    else:
+        axs[0, 0].axis('off')
+        axs[0, 0].set_title("No Autofluor")
+
+    # b) Raw CARS
+    if cars_8bit is not None:
+        axs[0, 1].imshow(cars_8bit, cmap='gray')
+        axs[0, 1].set_title(f"CARS (pos={pos_index+1})")
+    else:
+        axs[0, 1].axis('off')
+        axs[0, 1].set_title("No CARS")
+
+    # c) Cell mask
+    axs[0, 2].imshow(cell_rgb)
+    axs[0, 2].set_title("Cell Mask")
+
+    # d) Composite overlay
+    axs[0, 3].imshow(overlay_rgb)
+    axs[0, 3].set_title(f"Overlay {title_suffix}")
+
+    # Row 2
+    # e) Pure lipid
+    axs[1, 0].imshow(pure_lipid_rgb)
+    axs[1, 0].set_title("Pure Lipid Mask")
+
+    # f) Lipid+Lipofuscin
+    axs[1, 1].imshow(lipid_lipofuscin_rgb)
+    axs[1, 1].set_title("Lipid+Lipofuscin")
+
+    # g) Pure Lipofuscin
+    axs[1, 2].imshow(pure_lipofuscin_rgb)
+    axs[1, 2].set_title("Pure Lipofuscin")
+
+    # h) (Optional) Freed up for second overlay or hist plot, etc.
+    axs[1, 3].axis('off')
+    axs[1, 3].set_title("")
+
+    for row in axs:
+        for ax in row:
+            ax.axis('off')
 
     plt.tight_layout()
     plt.show()
@@ -1482,9 +1703,11 @@ def save_results_to_excel(results, summary, output_file):
 
     # If these columns exist, sort by them in order.
     if 'cell_marker' in results_df.columns and 'z_stack' in results_df.columns:
-        results_df = results_df.sort_values(by=['file_name', 'cell_marker', 'z_stack'])
+        results_df = results_df.sort_values(
+            by=['file_name', 'cell_marker', 'z_stack'])
     if 'cell_marker' in summary_df.columns and 'z_stack' in summary_df.columns:
-        summary_df = summary_df.sort_values(by=['file_name', 'cell_marker', 'z_stack'])
+        summary_df = summary_df.sort_values(
+            by=['file_name', 'cell_marker', 'z_stack'])
 
     with pd.ExcelWriter(output_file) as writer:
         results_df.to_excel(writer, sheet_name='Detailed Results', index=False)
@@ -1658,7 +1881,8 @@ def save_composite_images(fluor_images, cars_image, config_dict,
 
     cv2.imwrite(os.path.join(out_dir, f"{file_stub}_fluor.png"), fluor_bgr)
     cv2.imwrite(os.path.join(out_dir, f"{file_stub}_cars.png"), cars_gray_8bit)
-    cv2.imwrite(os.path.join(out_dir, f"{file_stub}_fluor_cars.png"), blend_bgr)
+    cv2.imwrite(os.path.join(
+        out_dir, f"{file_stub}_fluor_cars.png"), blend_bgr)
 
     print(f"Saved composites to {out_dir}")
 
@@ -1732,9 +1956,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = load_config(args.config)
-    
-    # from config_AD3d import config
-    
+
+    # from config_AD3a import config
+
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')
     reference_output_path = os.path.join(DIRECTORY, 'Reference.tif')
