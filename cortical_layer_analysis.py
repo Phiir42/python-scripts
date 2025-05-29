@@ -2,6 +2,14 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
+SUBCOLUMNS = [
+    "Lipids",
+    "Lipidated Lipofuscin",
+    "Lipofuscin",
+    "Myelination",
+    "Amyloid"
+]
+
 def determine_layer(file_name, z_stack):
     """
     Determines which layer (1..7) a given z_stack belongs to,
@@ -98,46 +106,46 @@ def determine_layer(file_name, z_stack):
 def create_formatted_worksheet(wb, sheet_name):
     """
     Create a worksheet with merged headers:
-      Row 1 => "Layer I" ... "White Matter" (7 merges)
-      Row 2 => "Lipids", "Lipidated Lipofuscin", "Lipofuscin" subcolumns
-    Column A => 'file_name' (merged vertically in each file_name block).
+      Row 1 => "file_name" (col A) and then each layer name spanning its subcolumns
+      Row 2 => subcolumn names from SUBCOLUMNS
     """
     ws = wb.create_sheet(title=sheet_name)
 
-    # Create top-left cell for "file_name", spanning row 1..2 horizontally
-    # but we'll only truly finalize merging that column for data blocks later.
+    # Column A: file_name header merged over two rows
     ws.cell(row=1, column=1, value="file_name")
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
     ws.cell(row=1, column=1).alignment = Alignment(horizontal='center', vertical='center')
     ws.cell(row=1, column=1).font = Font(bold=True)
 
-    # 7 layers, each has 3 subcolumns:
+    # Layer headers and subcolumns
     layer_names = ["Layer I", "Layer II", "Layer III", "Layer IV", "Layer V", "Layer VI", "White Matter"]
-    subcolumns = ["Lipids", "Lipidated Lipofuscin", "Lipofuscin"]
+    subcolumns = SUBCOLUMNS
+    n_sub = len(subcolumns)
 
-    # For each layer, we merge 3 columns in row 1
-    # Then row 2 has the subcolumn names.
-    start_col = 2  # columns start from B for the first layer
+    # Start writing layers in column B
+    start_col = 2
     for layer_name in layer_names:
-        # Merge row 1 over these 3 columns
+        # Merge row 1 across n_sub columns for this layer
         ws.merge_cells(
             start_row=1,
             start_column=start_col,
             end_row=1,
-            end_column=start_col + 2
+            end_column=start_col + n_sub - 1
         )
-        ws.cell(row=1, column=start_col, value=layer_name)
-        ws.cell(row=1, column=start_col).font = Font(bold=True)
-        ws.cell(row=1, column=start_col).alignment = Alignment(horizontal='center', vertical='center')
+        # Write the layer title
+        cell = ws.cell(row=1, column=start_col, value=layer_name)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
 
-        # Row 2 => subcol names
+        # Write each subcolumn in row 2
         for j, subcol_name in enumerate(subcolumns):
             c = start_col + j
-            ws.cell(row=2, column=c, value=subcol_name)
-            ws.cell(row=2, column=c).font = Font(bold=True)
-            ws.cell(row=2, column=c).alignment = Alignment(horizontal='center', vertical='center')
+            cell = ws.cell(row=2, column=c, value=subcol_name)
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
 
-        start_col += 3
+        # Advance by n_sub columns for the next layer
+        start_col += n_sub
 
     return ws
 
@@ -161,7 +169,9 @@ def main():
             'z_stack',
             'pure_lipid_percentage',
             'lipid_lipofuscin_percentage',
-            'lipofuscin_percentage'
+            'lipofuscin_percentage',
+            'myelination_percentage',
+            'amyloid_percentage'
         ]
         if not all(col in df.columns for col in required_cols):
             print(f"Skipping '{sheet_name}' - missing required columns.")
@@ -178,6 +188,8 @@ def main():
             pl = row_data['pure_lipid_percentage']
             llf = row_data['lipid_lipofuscin_percentage']
             lpf = row_data['lipofuscin_percentage']
+            mb  = row_data['myelination_percentage']
+            ap  = row_data['amyloid_percentage']
 
             layer = determine_layer(fn, zs)
             if layer is None:
@@ -186,7 +198,7 @@ def main():
             # Store in grouped_data
             if fn not in grouped_data:
                 grouped_data[fn] = {i: [] for i in range(1,8)}
-            grouped_data[fn][layer].append((pl, llf, lpf))
+            grouped_data[fn][layer].append((pl, llf, lpf, mb, ap))
 
         # Now we’ll write the data. Start from row=3 (below the headers).
         current_row = 3
@@ -197,8 +209,8 @@ def main():
             # layer 1 => columns 2,3,4
             # layer 2 => columns 5,6,7
             # ...
-            start_col = 2 + (layer - 1)*3
-            return start_col, start_col+1, start_col+2
+            start_col = 2 + (layer - 1)*len(SUBCOLUMNS)
+            return tuple(start_col + i for i in range(len(SUBCOLUMNS)))
 
         # Write each file_name in a block
         for file_name, layer_dict in grouped_data.items():
@@ -236,22 +248,15 @@ def main():
             # Now fill row by row
             # For each i in 0..(max_points-1), place data for each layer in that row
             for i in range(max_points):
-                # The row we’re writing to:
                 row_i = block_start + i
 
-                # For each layer 1..7, check if we have a data point
                 for lyr in range(1, 8):
-                    data_points = layer_dict[lyr]  # list of (pl, llf, lpf)
-                    # If i < len(data_points), we place it, otherwise leave blank
+                    data_points = grouped_data[file_name][lyr]
+                    cols = layer_to_cols(lyr)  # now returns 5 column indices
                     if i < len(data_points):
-                        pl, llf, lpf = data_points[i]
-                        c1, c2, c3 = layer_to_cols(lyr)
-                        ws.cell(row=row_i, column=c1, value=pl)
-                        ws.cell(row=row_i, column=c2, value=llf)
-                        ws.cell(row=row_i, column=c3, value=lpf)
-                    else:
-                        # This layer doesn't have an (i+1)-th data point => blank
-                        pass
+                        # data_points[i] is a 5-tuple: (pl, llf, lpf, mb, ap)
+                        for val, col in zip(data_points[i], cols):
+                            ws.cell(row=row_i, column=col, value=val)
 
             # After filling these max_points rows for this file_name,
             # move current_row down for the next file_name block

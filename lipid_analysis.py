@@ -1383,6 +1383,26 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                                          debug=True)
 
             cars_foci_mask = find_foci(corrected_cars_slice, **foci_params)
+            
+            # pull in the same thresholds you use in find_foci()
+            sat_thresh = foci_params['saturation_threshold']
+            sat_min   = foci_params['saturated_min_size']
+        
+            # binary map of all saturated pixels
+            dark_pixels = corrected_cars_slice >= sat_thresh
+        
+            # label connected components
+            labeled_dark = measure.label(dark_pixels)
+        
+            # build an “amyloid” mask of only the large components
+            amyloid_mask = np.zeros_like(corrected_cars_slice, dtype=bool)
+            for region in measure.regionprops(labeled_dark):
+                if region.area >= sat_min:
+                    # region.coords is an (N×2) array of (row, col)
+                    amyloid_mask[tuple(region.coords.T)] = True
+        
+            # fraction of image occupied by those large objects
+            amyloid_pct = amyloid_mask.sum() / amyloid_mask.size
 
             auto_ch_idx = config["channel_map"].get("Autofluorescence", None)
             auto_slice = max_project_fluorescence(
@@ -1467,6 +1487,8 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     for s_item in pos_summary:
                         s_item["cell_marker"] = cm
                         s_item["myelination_percentage"] = myelin_pct
+                        # record the amyloid‐plaque area fraction
+                        s_item["amyloid_percentage"] = amyloid_pct
 
                     all_positions_results.extend(pos_results)
                     all_positions_summary.extend(pos_summary)
