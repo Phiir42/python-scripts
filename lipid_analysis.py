@@ -85,6 +85,7 @@ from skimage.filters import (
 )
 from skimage.morphology import closing, disk, opening, remove_small_objects
 from skimage.segmentation import find_boundaries
+import sys
 from tifffile import imwrite
 
 import argparse
@@ -438,6 +439,36 @@ def create_custom_colormap(start_color, end_color):
     return LinearSegmentedColormap.from_list("custom_colormap", colors)
 
 
+def max_project_fluorescence(nd2obj, ch_index, position, fluoro_params):
+    """
+    Read each Z-slice from a fluorescence channel, apply an optional Gaussian blur
+    (sigma>0), then return a maximum-intensity projection.
+    """
+    z_stack_slices = []
+    total_z = nd2obj.sizes.get('z', 1)
+
+    # Pull the sigma (or default to 0 => skip blur)
+    gaussian_sigma = fluoro_params.get("gaussian_sigma", 0.0)
+
+    for z_slice in range(total_z):
+        raw_slice = nd2obj.get_frame_2D(
+            v=position, c=ch_index, z=z_slice)
+        raw_slice = np.nan_to_num(raw_slice)
+
+        # If sigma>0, apply a blur to this slice before storing it
+        if gaussian_sigma > 0:
+            blurred_slice = gaussian(
+                raw_slice, sigma=gaussian_sigma, preserve_range=True)
+            z_stack_slices.append(blurred_slice)
+        else:
+            # No blur
+            z_stack_slices.append(raw_slice)
+
+    # Finally, do a max projection of the slice stack
+    final_mip = np.max(np.array(z_stack_slices), axis=0)
+    return final_mip
+
+
 def process_fluorescence_channel(
     image_slice, cell_size, min_size, closing_radius, gaussian_sigma, fill_holes,
     threshold_method, offset, exclude_dark_regions=True,
@@ -746,6 +777,119 @@ def find_foci(
     return final_mask
 
 
+def infer_hyperspectral_mapping(spectrum_folder, config):
+    """
+    Infer {cars_nd2, fluor_nd2, cell_marker} for a hyperspectral folder
+    using naming conventions and files in config['paths']['data_directory'].
+    """
+    folder_base = os.path.basename(spectrum_folder)
+    name_l = folder_base.lower()
+
+    # 1) Decide cell marker and stacks label from folder name
+    if "astrocyte" in name_l:
+        cell_marker = "GFAP"
+        target_stacks_label = "Astrocytes"
+    elif "microglia" in name_l:
+        cell_marker = "IBA1"
+        target_stacks_label = "Microglia"
+    else:
+        raise ValueError(
+            f"Cannot infer cell type from folder '{folder_base}'. "
+            "Expected 'Astrocyte' or 'Microglia' in the name."
+        )
+
+    # 2) Pull tokens from config
+    cars_kw = config["file_keywords"]["cars_keyword"]               # e.g., "CARS2850"
+    mag_kw  = config["file_keywords"]["magnification_keyword"]      # e.g., "100X"
+
+    # 3) Try to learn the 'prefix' from any .nd2 inside the spectrum folder
+    nd2_inside = [f for f in os.listdir(spectrum_folder) if f.lower().endswith(".nd2")]
+    inferred_prefixes = []
+    for f in nd2_inside:
+        try:
+            meta = parse_nd2_filename(f, config)
+            if meta["prefix"]:
+                inferred_prefixes.append(meta["prefix"])
+        except Exception:
+            pass
+
+    prefix_hint = None
+    if inferred_prefixes:
+        # choose the most common
+        from collections import Counter
+        prefix_hint = Counter(inferred_prefixes).most_common(1)[0][0]
+
+    # 4) Scan the main data directory for candidate ND2s
+    data_dir = config["paths"]["data_directory"]
+    cars_candidates, fluor_candidates = [], []
+
+    for item in os.listdir(data_dir):
+        if not item.lower().endswith(".nd2"):
+            continue
+        meta = parse_nd2_filename(item, config)
+
+        # must match the target stacks label
+        if meta["stacks_label"] != target_stacks_label:
+            continue
+
+        # if we have a prefix hint, prefer files with that same prefix
+        prefix_ok = True if prefix_hint is None else (meta["prefix"] == prefix_hint)
+        if not prefix_ok:
+            continue
+
+        # Split by CARS vs Fluor
+        if meta["contains_cars"]:
+            cars_candidates.append(item)
+        else:
+            # optional: prefer fluorescence files that mention the marker or DAPI
+            fluor_candidates.append(item)
+
+    # If no candidates found with the strict prefix, relax the prefix constraint
+    if not cars_candidates or not fluor_candidates:
+        cars_candidates, fluor_candidates = [], []
+        for item in os.listdir(data_dir):
+            if not item.lower().endswith(".nd2"):
+                continue
+            meta = parse_nd2_filename(item, config)
+            if meta["stacks_label"] != target_stacks_label:
+                continue
+            if meta["contains_cars"]:
+                cars_candidates.append(item)
+            else:
+                fluor_candidates.append(item)
+
+    if not cars_candidates:
+        raise FileNotFoundError(
+            f"No CARS file found in '{data_dir}' for stacks '{target_stacks_label}'."
+        )
+    if not fluor_candidates:
+        raise FileNotFoundError(
+            f"No fluorescence file found in '{data_dir}' for stacks '{target_stacks_label}'."
+        )
+
+    # 5) Heuristics to pick the best one if multiple candidates exist
+    def pick_best(cands, wants_marker=None):
+        # prefer those with the magnification, then by explicit marker token, then lexicographically
+        def score(name):
+            s = 0
+            if mag_kw and mag_kw in name: s += 2
+            if wants_marker and wants_marker in name: s += 1
+            return s
+        cands_sorted = sorted(cands, key=lambda n: (-score(n), n))
+        return cands_sorted[0]
+
+    cars_name  = pick_best(cars_candidates)
+    fluor_name = pick_best(fluor_candidates, wants_marker=cell_marker)
+
+    mapping = {
+        "cars_nd2":  cars_name,                 # joined later with data_directory
+        "fluor_nd2": fluor_name,
+        "cell_marker": cell_marker
+    }
+    return mapping
+
+
+
 def process_hyperspectral_series(spectrum_folder, reference_image, output_path, foci_params):
     """
     Process a hyperspectral series to extract lipid droplet intensities.
@@ -777,6 +921,25 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
     None
         Saves an Excel file with two sheets ('Raw Data' and 'Normalized Data').
     """
+    # Look up the mapping for this folder
+    folder_base = os.path.basename(spectrum_folder)
+    cfg_map = config.get("hyperspectral_mapping", {})
+    print("Available hyperspectral_mapping keys:", list(cfg_map.keys()))
+    print("Looking for folder_base:", folder_base)
+    
+    mapping = cfg_map.get(folder_base)
+    if mapping is None:
+        # fallback: infer from folder name + directory contents
+        mapping = infer_hyperspectral_mapping(spectrum_folder, config)
+        print("[HYPERMAP] Inferred mapping:", mapping)
+    else:
+        print("[HYPERMAP] Using config mapping:", mapping)
+            
+    data_dir       = config["paths"]["data_directory"]
+    cars_nd2_path  = os.path.join(data_dir, mapping["cars_nd2"])
+    fluor_nd2_path = os.path.join(data_dir, mapping["fluor_nd2"])
+    
+    # Original 32-file loop
     nd2_files = sorted([
         os.path.join(spectrum_folder, f)
         for f in os.listdir(spectrum_folder)
@@ -796,25 +959,145 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
             corrected_images.append(c_image)
 
     mask_image = corrected_images[8]  # 9th image is index 8
+    
+    with ND2Reader(cars_nd2_path) as cars_nd2:
+        total_v = cars_nd2.sizes.get('v', 1)
+        best_v, best_r = None, -np.inf
+
+        # Precompute hyperspec fingerprint
+        H = mask_image.astype(np.float32)
+        Hm, Hs = H.mean(), H.std()
+        
+        for v_idx in range(total_v):
+            # Build a max‐projection across all Z for this position
+            mip_slices = []
+            for z in range(cars_nd2.sizes.get('z', 1)):
+                raw_sl = np.nan_to_num(
+                    cars_nd2.get_frame_2D(v=v_idx, c=2, z=z)
+                ).astype(np.float32)
+                filtered = apply_east_shadows_filter(raw_sl)
+                corrected = np.nan_to_num(filtered / reference_image)
+                if foci_params.get("sigma", 0) > 0:
+                    corrected = gaussian(corrected,
+                                         sigma=foci_params["sigma"],
+                                         preserve_range=True)
+                mip_slices.append(corrected)
+            C = np.max(np.stack(mip_slices, axis=0), axis=0)
+            
+            # Compute Pearson r between H and this MIP
+            Cm, Cs = C.mean(), C.std()
+            r = ((H - Hm) * (C - Cm)).ravel().sum() / (Hs * Cs * H.size)
+    
+            if r > best_r:
+                best_r, best_v = r, v_idx
+
+    print(f"[HYPERMAP] Folder={folder_base}, best v={best_v}, r={best_r:.3f}")
+    
+    cars_mip = mask_image
+    
+    # --- build the cell mask MIP ---
+    with ND2Reader(fluor_nd2_path) as fl_nd2:
+        cell_marker = mapping["cell_marker"]            # "GFAP" or "IBA1"
+        ch_idx = config["channel_map"][cell_marker]
+    
+        fluoro_mip = max_project_fluorescence(
+            fl_nd2,
+            ch_index = ch_idx,
+            position = best_v,
+            fluoro_params = config["morphology_params"]["fluorescence_params"]
+        )
+    
+    # Pull base params and apply per-marker overrides (just like stacks path)
+    fluorescence_params = config["morphology_params"]["fluorescence_params"]
+    marker_thresholds   = config.get("marker_thresholds", {}).get(cell_marker, {})
+    
+    threshold_method = marker_thresholds.get(
+        "threshold_method", fluorescence_params.get("threshold_method", "otsu")
+    )
+    offset_val = marker_thresholds.get(
+        "offset", fluorescence_params.get("offset", 1.0)
+    )
+    
+    cell_mask = process_fluorescence_channel(
+        fluoro_mip,
+        cell_size       = fluorescence_params["cell_size"],
+        min_size        = fluorescence_params["min_size"],
+        closing_radius  = fluorescence_params["closing_radius"],
+        gaussian_sigma  = fluorescence_params["gaussian_sigma"],
+        fill_holes      = fluorescence_params["fill_holes"],
+        threshold_method= threshold_method,
+        offset          = offset_val,
+        exclude_dark_regions = fluorescence_params.get("exclude_dark_regions", True),
+        dark_threshold       = fluorescence_params.get("dark_threshold", 50),
+        min_hole_size        = fluorescence_params.get("min_hole_size", 20000),
+        debug          = False
+    )
+    
+    # --- build the autofluor mask MIP ---
+    with ND2Reader(fluor_nd2_path) as fl_nd2:
+        auto_mip = max_project_fluorescence(
+            fl_nd2,
+            ch_index = config["channel_map"]["Autofluorescence"],
+            position = best_v,
+            fluoro_params = config["morphology_params"]["autofluorescence_params"]
+        )
+    
     lipid_mask = find_foci(mask_image, **foci_params)
+    auto_mask = find_foci(
+        auto_mip,
+        **config["morphology_params"]["autofluorescence_params"],
+        debug=False
+    )
+    pure_lipid_mask       = lipid_mask & ~auto_mask
+    lipid_lipofuscin_mask = lipid_mask &  auto_mask
+    pure_lipofuscin_mask  = auto_mask  & ~lipid_mask
+
+    # restrict to intracellular objects
+    intracellular_pure_lipid       = pure_lipid_mask       & cell_mask
+    intracellular_lipid_lipofuscin = lipid_lipofuscin_mask & cell_mask
+    intracellular_pure_lipofuscin  = pure_lipofuscin_mask  & cell_mask
+
+    # --- 4) Optional debug overlay display  --------------------------
+    debug_display_3way_segmentation(
+        intracellular_pure_lipid,
+        intracellular_lipid_lipofuscin,
+        intracellular_pure_lipofuscin,
+        cell_mask,
+        auto_image=auto_mip,
+        cars_image=cars_mip,
+        pos_index=best_v,
+        title_suffix=f"[{mapping['cell_marker']}]"
+    )
 
     # (Optional) visualize the mask overlay
     visualize_hyperspectral_mask_overlay(mask_image, lipid_mask)
 
-    # Extract intensities for each droplet across all 32 corrected images
+    # Label droplets and build raw intensity table with category
     lipid_labels = measure.label(lipid_mask)
     lipid_data = []
 
-    for lipid in measure.regionprops(lipid_labels):
-        lipid_id = lipid.label
-        intensities = []
-        for img in corrected_images:
-            mean_intensity = np.mean(
-                img[lipid.coords[:, 0], lipid.coords[:, 1]])
-            intensities.append(mean_intensity)
-        lipid_data.append([lipid_id] + intensities)
+    for region in measure.regionprops(lipid_labels):
+        lipid_id = region.label
+        # determine category by checking the object’s centroid (more robust)
+        y0, x0 = region.centroid
+        r0, c0 = int(y0), int(x0)
+        if pure_lipid_mask[r0, c0]:
+            category = "Lipid"
+        elif lipid_lipofuscin_mask[r0, c0]:
+            category = "Lipidated Lipofuscin"
+        else:
+            category = "Lipofuscin"
 
-    columns_raw = ["Lipid ID"] + [f"Wavenumber {i+1}" for i in range(32)]
+        # collect intensities across the 32 wavelengths
+        intensities = [
+            np.mean(img[region.coords[:,0], region.coords[:,1]])
+            for img in corrected_images
+        ]
+        is_intra = np.any(cell_mask[region.coords[:,0], region.coords[:,1]])
+        location = "Intracellular" if is_intra else "Extracellular"
+        lipid_data.append([lipid_id, category, location] + intensities)
+
+    columns_raw = ["Lipid ID", "Category", "Location"] + [f"Wavenumber {i+1}" for i in range(32)]
     lipid_df_raw = pd.DataFrame(lipid_data, columns=columns_raw)
     lipid_df_norm = lipid_df_raw.copy()
 
@@ -825,10 +1108,14 @@ def process_hyperspectral_series(spectrum_folder, reference_image, output_path, 
     wavelengths_nm = [801.0 - 0.5 * i for i in range(32)]
     wavenumbers = [compute_wavenumber(wl) for wl in wavelengths_nm]
 
-    new_col_names = ["Lipid ID"] + [f"{wn:.2f}" for wn in wavenumbers]
-    data_to_normalize = lipid_df_norm.iloc[:, 1:]
+    new_col_names = ["Lipid ID", "Category", "Location"] + [f"{wn:.2f}" for wn in wavenumbers]
+    # only normalize the numeric wavenumber columns (skip ID/Category/Location)
+    # these are columns 3..end
+    data_to_normalize = lipid_df_norm.iloc[:, 3:]
+    # replace any zero-max with 1 to avoid division-by-zero
     row_maxes = data_to_normalize.max(axis=1).replace({0: 1})
-    lipid_df_norm.iloc[:, 1:] = data_to_normalize.div(row_maxes, axis=0)
+    lipid_df_norm.iloc[:, 3:] = data_to_normalize.div(row_maxes, axis=0)
+    # now reassign all column names
     lipid_df_norm.columns = new_col_names
 
     with pd.ExcelWriter(output_path) as writer:
@@ -1269,35 +1556,6 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
 
             # 4) Finally, take maximum-intensity projection across Z
             final_mip = np.max(np.array(z_stack_slices_cars), axis=0)
-            return final_mip
-
-        def max_project_fluorescence(nd2obj, ch_index, position, fluoro_params):
-            """
-            Read each Z-slice from a fluorescence channel, apply an optional Gaussian blur
-            (sigma>0), then return a maximum-intensity projection.
-            """
-            z_stack_slices = []
-            total_z = nd2obj.sizes.get('z', 1)
-
-            # Pull the sigma (or default to 0 => skip blur)
-            gaussian_sigma = fluoro_params.get("gaussian_sigma", 0.0)
-
-            for z_slice in range(total_z):
-                raw_slice = nd2obj.get_frame_2D(
-                    v=position, c=ch_index, z=z_slice)
-                raw_slice = np.nan_to_num(raw_slice)
-
-                # If sigma>0, apply a blur to this slice before storing it
-                if gaussian_sigma > 0:
-                    blurred_slice = gaussian(
-                        raw_slice, sigma=gaussian_sigma, preserve_range=True)
-                    z_stack_slices.append(blurred_slice)
-                else:
-                    # No blur
-                    z_stack_slices.append(raw_slice)
-
-            # Finally, do a max projection of the slice stack
-            final_mip = np.max(np.array(z_stack_slices), axis=0)
             return final_mip
 
         for pos in range(fluoro_nd2.sizes['v']):
@@ -1972,14 +2230,16 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True,
-                        help="Path to a .py file containing `config` dict.")
-    args = parser.parse_args()
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--config", required=True,
+    #                     help="Path to a .py file containing `config` dict.")
+    # args = parser.parse_args()
 
-    config = load_config(args.config)
+    # config = load_config(args.config)
+    
+    sys.path.insert(0, r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files")
 
-    # from config_AD3a import config
+    from config_AD3d import config
 
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')
@@ -1993,7 +2253,7 @@ if __name__ == "__main__":
         blur_radius_microns=2
     )
 
-    # 2) Process paired files
+    # # 2) Process paired files
     paired_files, hyperspectral_folders = find_nd2_files(DIRECTORY)
     all_results_list = []
     all_summary_list = []

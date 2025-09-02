@@ -3,9 +3,6 @@
 prep_prism_cortical_layers.py
 ─────────────────────────────
 Create a “Prism Prep” sheet from the cortical-layer workbook.
-
-2025-05-01  • Fixed a bug where the header cell in column A was counted as an
-extra replicate, yielding an empty R1 column for every condition.
 """
 
 # ── USER SETTINGS ──────────────────────────────────────────────────────────────
@@ -18,7 +15,7 @@ from collections import defaultdict
 from statistics import mean
 
 import openpyxl as oxl
-
+from openpyxl.styles import Alignment, Font
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 CELL_TYPES  = ["Microglia", "Astrocytes", "Neurons"]
@@ -27,7 +24,7 @@ CONDITIONS  = ["Control", "AD33", "AD44"]
 LAYERS   = ["Layer I", "Layer II", "Layer III",
             "Layer IV", "Layer V", "Layer VI", "White Matter"]
 
-METRICS  = ["Lipids", "Lipofuscin", "Lipidated Lipofuscin"]
+METRICS  = ["Lipids", "Lipofuscin", "Lipidated Lipofuscin", "Myelination", "Amyloid"]
 
 HEADER_ROWS = 2                     # rows 1–2 = column headers
 START_ROW   = HEADER_ROWS + 1       # first numeric row (1-based index)
@@ -38,6 +35,7 @@ START_ROW   = HEADER_ROWS + 1       # first numeric row (1-based index)
 data = {m: {l: defaultdict(lambda: defaultdict(list)) for l in LAYERS}
         for m in METRICS}
 rep_counts = {ct: {cond: 0 for cond in CONDITIONS} for ct in CELL_TYPES}
+donor_blocks = {ct: {cond: [] for cond in CONDITIONS} for ct in CELL_TYPES}
 
 wb_in = oxl.load_workbook(INPUT_FILE, data_only=True)
 
@@ -67,6 +65,11 @@ for cell_type in CELL_TYPES:
             key=lambda r: r.min_row
         )
         rep_counts[cell_type][cond] = len(replicate_ranges)
+        
+        for rng in replicate_ranges:
+            file_name_in_A = ws.cell(rng.min_row, 1).value
+            donor_id = file_name_in_A.split("-")[1]
+            donor_blocks[cell_type][cond].append(donor_id)
 
         # average each replicate block
         for rng in replicate_ranges:                       # keep top→bottom
@@ -144,3 +147,115 @@ out_path = (pathlib.Path(OUTPUT_FILE).expanduser().resolve()
 
 wb_out.save(out_path)
 print(f"✅  Prism Prep sheet added.  Saved to: {out_path}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 3 ─ Build “Prism Prep – Donor” for Myelination & Amyloid combined
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 3a) Build donors_per_condition exactly as above
+donors_per_condition = {}
+for cond in CONDITIONS:
+    combined = []
+    for ct in CELL_TYPES:
+        combined += donor_blocks[ct][cond]
+    seen = set()
+    unique_list = []
+    for d in combined:
+        if d not in seen:
+            seen.add(d)
+            unique_list.append(d)
+    donors_per_condition[cond] = unique_list
+
+# 3b) Compute one combined value per donor ↔ layer ↔ metric
+combined_data = {
+    m: {layer: {cond: {} for cond in CONDITIONS} for layer in LAYERS}
+    for m in ["Myelination", "Amyloid"]
+}
+
+for metric in ["Myelination", "Amyloid"]:
+    for layer in LAYERS:
+        for cond in CONDITIONS:
+            for donor_id in donors_per_condition[cond]:
+                vals_for_donor = []
+                for ct in CELL_TYPES:
+                    block_list = donor_blocks[ct][cond]
+                    data_list  = data[metric][layer][ct][cond]
+                    for idx, block_donor in enumerate(block_list):
+                        if block_donor == donor_id:
+                            v = data_list[idx]
+                            # Only append if not None:
+                            if v is not None:
+                                vals_for_donor.append(v)
+
+                # Now compute mean only if there’s at least one numeric value
+                if vals_for_donor:
+                    combined_data[metric][layer][cond][donor_id] = mean(vals_for_donor)
+                else:
+                    combined_data[metric][layer][cond][donor_id] = None
+
+# 3c) Create the new "Prism Prep - Donor" sheet
+sheet_name = "Prism Prep - Donor"
+if sheet_name in wb_out.sheetnames:
+    del wb_out[sheet_name]
+ws_donor = wb_out.create_sheet(sheet_name)
+
+# Header rows (1–2): Metric | Layer | [Condition1 merged] [Condition2 merged] ...
+ws_donor.cell(row=1, column=1, value="Metric")
+ws_donor.cell(row=1, column=2, value="Layer")
+ws_donor.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+ws_donor.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+ws_donor.cell(row=1, column=1).alignment = Alignment(horizontal='center', vertical='center')
+ws_donor.cell(row=1, column=2).alignment = Alignment(horizontal='center', vertical='center')
+ws_donor.cell(row=1, column=1).font = Font(bold=True)
+ws_donor.cell(row=1, column=2).font = Font(bold=True)
+
+cur_col = 3
+for cond in CONDITIONS:
+    n_donors = len(donors_per_condition[cond])
+    if n_donors == 0:
+        continue
+    start = cur_col
+    ws_donor.merge_cells(
+        start_row=1,
+        start_column=start,
+        end_row=1,
+        end_column=start + n_donors - 1
+    )
+    ws_donor.cell(row=1, column=start, value=cond).alignment = Alignment(horizontal='center')
+    ws_donor.cell(row=1, column=start).font = Font(bold=True)
+    for r in range(1, n_donors + 1):
+        ws_donor.cell(row=2, column=cur_col, value=f"R{r}").alignment = Alignment(horizontal='center')
+        ws_donor.cell(row=2, column=cur_col).font = Font(bold=True)
+        cur_col += 1
+
+# 3d) Fill rows 3→, one block for Myelination then one for Amyloid
+row_ptr = 3
+for metric in ["Myelination", "Amyloid"]:
+    block_start = row_ptr
+    for layer in LAYERS:
+        ws_donor.cell(row=row_ptr, column=2, value=layer)
+        col_ptr = 3
+        for cond in CONDITIONS:
+            for donor_id in donors_per_condition[cond]:
+                ws_donor.cell(
+                    row=row_ptr,
+                    column=col_ptr,
+                    value=combined_data[metric][layer][cond][donor_id]
+                )
+                col_ptr += 1
+        row_ptr += 1
+    # Merge the metric label down its 7‐row block
+    ws_donor.cell(row=block_start, column=1, value=metric)
+    ws_donor.merge_cells(
+        start_row=block_start,
+        end_row=row_ptr - 1,
+        start_column=1,
+        end_column=1
+    )
+    ws_donor.cell(row=block_start, column=1).alignment = Alignment(horizontal='center', vertical='center')
+
+ws_donor.freeze_panes = "C4"
+
+# 3e) Save the workbook one more time
+wb_out.save(out_path)
+print(f"✅  Prism Prep - Donor sheet added.  Saved to: {out_path}")

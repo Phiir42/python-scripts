@@ -80,6 +80,18 @@ config = {
     "paths": {
         "data_directory": r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD3a"
     },
+    "hyperspectral_mapping": {
+        "AD33_MicrogliaSpectrumCH": {
+            "cars_nd2": "AD33-S1178-CARS2850-100X-StacksMicroglia.nd2",
+            "fluor_nd2": "AD33-S1178-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+            "position": 0
+        },
+        "AD33_AstrocyteSpectrumCH": {
+            "cars_nd2": "AD33-S1178-CARS2850-100X-StacksAstrocytes.nd2",
+            "fluor_nd2": "AD33-S1178-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+            "position": 0
+        }
+    },
     "stack_offset": {
         "DAPI": 0,
         "IBA1": 0,

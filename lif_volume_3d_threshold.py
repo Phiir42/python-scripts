@@ -89,4 +89,4 @@ if __name__ == "__main__":
         debug=True
     )
     print(df.to_string(index=False))
-    # df.to_csv("green_volume_3d.csv", index=False)
+    df.to_csv("green_volume_3d.csv", index=False)
