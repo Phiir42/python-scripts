@@ -78,7 +78,7 @@ config = {
         "DEFAULT": (255, 255, 255)  # fallback color (white)
     },
     "paths": {
-        "data_directory": r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD3b"
+        "data_directory": r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD3b"
     },
     "stack_offset": {
         "DAPI": 0,
@@ -92,6 +92,21 @@ config = {
         "Microglia": ["IBA1"],
         "Astrocytes": ["GFAP"]
     }
+}
+# Folder-name tokens → stacks label + allowed markers (priority left→right)
+config["hyperspectral_folder_map"] = {
+    "astrocyte": {
+        "label": "Astrocytes",
+        "markers": ["GFAP"],              # add GFAP to channel_map if you use it
+    },
+    "microglia": {
+        "label": "Microglia",
+        "markers": ["IBA1"],
+    },
+    "neuron": {
+        "label": "Neurons",
+        "markers": ["TUJ_Ck", "TUJ_Ms", "MAP2_Sigma"],  # <-- your 3 neuron markers
+    },
 }
 
 

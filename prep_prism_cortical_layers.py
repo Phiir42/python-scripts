@@ -6,7 +6,7 @@ Create a “Prism Prep” sheet from the cortical-layer workbook.
 """
 
 # ── USER SETTINGS ──────────────────────────────────────────────────────────────
-INPUT_FILE  = r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD_Lipid_Statistics_CorticalLayers.xlsx"
+INPUT_FILE  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD_Lipid_Statistics_CorticalLayers.xlsx"
 OUTPUT_FILE = None          # None ➜ “…_prism.xlsx” alongside the input file
 # ───────────────────────────────────────────────────────────────────────────────
 

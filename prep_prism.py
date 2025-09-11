@@ -12,7 +12,7 @@ Creates / replaces the following worksheets:
 """
 
 # ── USER SETTINGS ─────────────────────────────────────────────────────────────
-INPUT_FILE  = r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD Lipid Statistics.xlsx"   # ← edit to your aggregated file
+INPUT_FILE  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD Lipid Statistics.xlsx"   # ← edit to your aggregated file
 OUTPUT_FILE = None        # leave None to get “…_prism.xlsx” in same folder
 # ──────────────────────────────────────────────────────────────────────────────
 

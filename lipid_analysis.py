@@ -779,30 +779,42 @@ def find_foci(
 
 def infer_hyperspectral_mapping(spectrum_folder, config):
     """
-    Infer {cars_nd2, fluor_nd2, cell_marker} for a hyperspectral folder
-    using naming conventions and files in config['paths']['data_directory'].
+    Infer {cars_nd2, fluor_nd2, cell_marker} for a hyperspectral folder using
+    folder-name tokens and actual files present in config['paths']['data_directory'].
+
+    - Folder name is matched (lowercased) against keys in config['hyperspectral_folder_map'].
+    - For the matched token, we get its stacks label and a PRIORITIZED list of markers.
+    - We scan the data_directory for matching ND2s with the same stacks label.
+      * We pick CARS vs Fluor by 'cars_keyword'.
+      * For Fluor, we prefer filenames containing earlier markers in the list.
+      * We also reward the magnification keyword and (if available) a prefix hint from
+        ND2s inside the hyperspec folder.
     """
     folder_base = os.path.basename(spectrum_folder)
     name_l = folder_base.lower()
 
-    # 1) Decide cell marker and stacks label from folder name
-    if "astrocyte" in name_l:
-        cell_marker = "GFAP"
-        target_stacks_label = "Astrocytes"
-    elif "microglia" in name_l:
-        cell_marker = "IBA1"
-        target_stacks_label = "Microglia"
-    else:
+    # 0) Required config bits
+    folder_map = config.get("hyperspectral_folder_map", {})
+    if not folder_map:
+        raise ValueError("config['hyperspectral_folder_map'] is missing or empty.")
+
+    cars_kw = config["file_keywords"]["cars_keyword"]            # e.g., "CARS2850"
+    mag_kw  = config["file_keywords"]["magnification_keyword"]   # e.g., "100X"
+
+    # 1) Decide token, stacks label, and allowed markers (priority order)
+    matched = None
+    for token, spec in folder_map.items():
+        if token in name_l:
+            matched = (token, spec["label"], list(spec["markers"]))
+            break
+    if matched is None:
         raise ValueError(
             f"Cannot infer cell type from folder '{folder_base}'. "
-            "Expected 'Astrocyte' or 'Microglia' in the name."
+            f"Expected one of: {', '.join(folder_map.keys())} in the name."
         )
+    token, target_stacks_label, marker_priority = matched
 
-    # 2) Pull tokens from config
-    cars_kw = config["file_keywords"]["cars_keyword"]               # e.g., "CARS2850"
-    mag_kw  = config["file_keywords"]["magnification_keyword"]      # e.g., "100X"
-
-    # 3) Try to learn the 'prefix' from any .nd2 inside the spectrum folder
+    # 2) Try to learn a 'prefix hint' from any ND2 inside the spectrum folder
     nd2_inside = [f for f in os.listdir(spectrum_folder) if f.lower().endswith(".nd2")]
     inferred_prefixes = []
     for f in nd2_inside:
@@ -812,82 +824,96 @@ def infer_hyperspectral_mapping(spectrum_folder, config):
                 inferred_prefixes.append(meta["prefix"])
         except Exception:
             pass
-
     prefix_hint = None
     if inferred_prefixes:
-        # choose the most common
         from collections import Counter
         prefix_hint = Counter(inferred_prefixes).most_common(1)[0][0]
 
-    # 4) Scan the main data directory for candidate ND2s
+    def stacks_label_matches(meta_label, target_label):
+        """Treat empty/None label as a wildcard."""
+        return (meta_label is None) or (meta_label == "") or (meta_label == target_label)
+
+    # 3) Scan main data directory for ND2s with the right stacks label
     data_dir = config["paths"]["data_directory"]
     cars_candidates, fluor_candidates = [], []
-
     for item in os.listdir(data_dir):
         if not item.lower().endswith(".nd2"):
             continue
         meta = parse_nd2_filename(item, config)
 
-        # must match the target stacks label
-        if meta["stacks_label"] != target_stacks_label:
+        # accept files with empty stacks label (just "Stacks") as a wildcard
+        if not stacks_label_matches(meta["stacks_label"], target_stacks_label):
             continue
 
-        # if we have a prefix hint, prefer files with that same prefix
-        prefix_ok = True if prefix_hint is None else (meta["prefix"] == prefix_hint)
-        if not prefix_ok:
-            continue
-
-        # Split by CARS vs Fluor
         if meta["contains_cars"]:
-            cars_candidates.append(item)
+            cars_candidates.append((item, meta))
         else:
-            # optional: prefer fluorescence files that mention the marker or DAPI
-            fluor_candidates.append(item)
+            fluor_candidates.append((item, meta))
 
-    # If no candidates found with the strict prefix, relax the prefix constraint
+    # If nothing found, keep label but relax everything else (but still allow empty label)
     if not cars_candidates or not fluor_candidates:
         cars_candidates, fluor_candidates = [], []
         for item in os.listdir(data_dir):
             if not item.lower().endswith(".nd2"):
                 continue
             meta = parse_nd2_filename(item, config)
-            if meta["stacks_label"] != target_stacks_label:
+
+            if not stacks_label_matches(meta["stacks_label"], target_stacks_label):
                 continue
+
             if meta["contains_cars"]:
-                cars_candidates.append(item)
+                cars_candidates.append((item, meta))
             else:
-                fluor_candidates.append(item)
+                fluor_candidates.append((item, meta))
 
     if not cars_candidates:
         raise FileNotFoundError(
-            f"No CARS file found in '{data_dir}' for stacks '{target_stacks_label}'."
+            f"No CARS file found in '{data_dir}' for stacks '{target_stacks_label}'. "
+            f"(Note: files named only '...-Stacks.nd2' are allowed and treated as wildcard.)"
         )
     if not fluor_candidates:
         raise FileNotFoundError(
-            f"No fluorescence file found in '{data_dir}' for stacks '{target_stacks_label}'."
+            f"No fluorescence file found in '{data_dir}' for stacks '{target_stacks_label}'. "
+            f"(Note: files named only '...-Stacks.nd2' are allowed and treated as wildcard.)"
         )
 
-    # 5) Heuristics to pick the best one if multiple candidates exist
-    def pick_best(cands, wants_marker=None):
-        # prefer those with the magnification, then by explicit marker token, then lexicographically
-        def score(name):
-            s = 0
-            if mag_kw and mag_kw in name: s += 2
-            if wants_marker and wants_marker in name: s += 1
-            return s
-        cands_sorted = sorted(cands, key=lambda n: (-score(n), n))
-        return cands_sorted[0]
+    # 4) Scoring helpers
+    def score_cars(name, meta):
+        s = 0
+        if mag_kw and mag_kw in name: s += 2
+        if prefix_hint and meta["prefix"] == prefix_hint: s += 1
+        return s
 
-    cars_name  = pick_best(cars_candidates)
-    fluor_name = pick_best(fluor_candidates, wants_marker=cell_marker)
+    def score_fluor(name, meta):
+        s = 0
+        if mag_kw and mag_kw in name: s += 2
+        if prefix_hint and meta["prefix"] == prefix_hint: s += 1
+        # prefer earlier markers in the priority list if mentioned in the filename
+        for idx, mk in enumerate(marker_priority):
+            if mk in name:
+                s += (10 - idx)  # earlier marker ⇒ bigger bonus
+                break
+        return s
+
+    # 5) Pick best cars and fluor by score
+    cars_name, _  = max(cars_candidates,  key=lambda nm: score_cars(*nm))
+    fluor_name, _ = max(fluor_candidates, key=lambda nm: score_fluor(*nm))
+
+    # 6) Decide the cell_marker we actually got (based on which marker string appears)
+    chosen_marker = None
+    for mk in marker_priority:
+        if mk in fluor_name:
+            chosen_marker = mk
+            break
+    if chosen_marker is None:
+        chosen_marker = marker_priority[0]
 
     mapping = {
-        "cars_nd2":  cars_name,                 # joined later with data_directory
+        "cars_nd2":  cars_name,
         "fluor_nd2": fluor_name,
-        "cell_marker": cell_marker
+        "cell_marker": chosen_marker
     }
     return mapping
-
 
 
 def process_hyperspectral_series(spectrum_folder, reference_image, output_path, foci_params):
@@ -2230,16 +2256,33 @@ def save_dapi_marker_overlay(dapi_mask, marker_mask, marker_name, out_path):
 
 
 if __name__ == "__main__":
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument("--config", required=True,
-    #                     help="Path to a .py file containing `config` dict.")
-    # args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        help="Path to a .py file containing `config` dict. "
+             "If not provided and --debug_single is set, will run the debug config."
+    )
+    parser.add_argument(
+        "--debug_single",
+        action="store_true",
+        help="Run a hardcoded single config file for debugging (ignores --config)."
+    )
+    args = parser.parse_args()
 
-    # config = load_config(args.config)
-    
-    sys.path.insert(0, r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files")
+    # Hardcoded debug config path
+    debug_config_path = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3a.py"
 
-    from config_AD3d import config
+    if args.debug_single:
+        cfg_path = debug_config_path
+        print(f"[DEBUG MODE] Running lipid_analysis with config: {cfg_path}")
+    elif args.config:
+        cfg_path = args.config
+    else:
+        parser.error("Either --config must be provided or --debug_single must be set.")
+
+    config = load_config(cfg_path)
+
+    sys.path.insert(0, r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files")
 
     DIRECTORY = config["paths"]["data_directory"]
     reference_file = os.path.join(DIRECTORY, 'Reference.nd2')
