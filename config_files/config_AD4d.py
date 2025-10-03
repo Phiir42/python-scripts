@@ -64,7 +64,16 @@ config = {
             "remove_saturated": True,
             "saturation_threshold": 2500,
             "saturated_min_size": 5000
-        }
+        },
+        "lamp2_params": {
+            "sigma": 2,
+            "min_distance": 15,
+            "min_size": 35,
+            "std_dev_multiplier": 3,
+            "remove_saturated": False,
+            "saturation_threshold": 2500,
+            "saturated_min_size": 5000
+          }
     },
     "colormaps": {
         "DAPI": (0, 0, 255),  # blue
