@@ -1,6 +1,7 @@
 # run_debug.py (place this NEXT TO the 'lipid_analysis/' folder)
 import sys
 from pathlib import Path
+from lipid_analysis.cli import main
 
 # Ensure project root is on sys.path
 ROOT = Path(__file__).resolve().parent
@@ -15,5 +16,4 @@ sys.argv = [
     "--verbose"
 ]
 
-from lipid_analysis.cli import main
 main()

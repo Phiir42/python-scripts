@@ -34,7 +34,9 @@ CELL_MAP = {
 }
 
 # Prepare an accumulator for each output sheet
-sheet_accumulator = {f"{cond} {ctype}": [] for cond in CONDITIONS for ctype in CELL_MAP.values()}
+sheet_accumulator: dict[str, list[pd.Series]] = {
+    f"{cond} {ctype}": [] for cond in CONDITIONS for ctype in CELL_MAP.values()
+}
 
 # Iterate subfolders
 for subdir in PARENT_DIR.iterdir():

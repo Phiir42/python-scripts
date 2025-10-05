@@ -217,7 +217,7 @@ def main():
 
             # For each of the 7 layers, we have some number of data points
             # The block height = the maximum number of data points among all layers
-            max_points = max(len(layer_dict[l]) for l in range(1,8))
+            max_points = max(len(layer_dict[layer]) for layer in range(1, 8))
 
             # If a file_name has 0 data points altogether, skip
             if max_points == 0:

@@ -1,5 +1,6 @@
 # lipid_analysis/imaging.py
-from typing import Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Sequence
+from numpy.typing import NDArray
 
 import numpy as np
 from skimage.exposure import rescale_intensity
@@ -30,7 +31,10 @@ def blend_fluorescence_cars(
     return np.clip(blend, 0, 255).astype(np.uint8)
 
 
-def colorize_channel(image_2d: np.ndarray, rgb_color: Sequence[float]) -> np.ndarray:
+def colorize_channel(
+    image_2d: np.ndarray,
+    rgb_color: Sequence[float] | NDArray[np.floating],
+) -> np.ndarray:
     """Rescale 2D image to [0..1] and apply rgb_color (len=3 floats in [0,1]). Returns H×W×3 float."""
     if image_2d.ndim != 2:
         raise ValueError(f"colorize_channel expects 2D, got {image_2d.shape}")
@@ -44,7 +48,7 @@ def colorize_channel(image_2d: np.ndarray, rgb_color: Sequence[float]) -> np.nda
 
 
 def composite_fluorescence(
-    fluor_images: Dict[str, np.ndarray], config_dict: Mapping
+    fluor_images: Dict[str, np.ndarray], config_dict: Mapping[str, Any]
 ) -> np.ndarray:
     """
     Build an RGB composite by colorizing each marker channel and summing (clipped).

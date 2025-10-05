@@ -517,7 +517,7 @@ def process_fluorescence_channel(
         else:
             base_threshold = threshold_otsu(valid_pixels)
     else:
-        base_threshold = 999999;
+        base_threshold = 999999
 
     final_threshold = base_threshold * offset
     binary_mask = image_slice > final_threshold
@@ -1827,7 +1827,8 @@ if __name__ == "__main__":
     reference_image = generate_reference_image(
         reference_file,
         reference_output_path,
-        blur_radius_microns=2
+        blur_radius_microns=2,
+        config=config,
     )
 
     # 2) Process paired files

@@ -2,9 +2,15 @@ import os
 import pandas as pd
 from nd2reader import ND2Reader
 import numpy as np
-from skimage import filters, measure, morphology, feature, segmentation
-from skimage.morphology import opening, closing, disk, remove_small_objects, binary_dilation, erosion, dilation
-from skimage.segmentation import watershed, find_boundaries
+from skimage import measure, feature, segmentation
+from skimage.morphology import (
+    opening,
+    closing,
+    disk,
+    remove_small_objects,
+    erosion,
+)
+from skimage.segmentation import watershed
 from skimage.filters import gaussian, threshold_otsu, threshold_triangle
 from skimage.measure import regionprops, label
 from skimage.color import label2rgb
@@ -105,7 +111,7 @@ def separate_circular_subregions(binary_mask, min_form_factor=0.7, max_aspect_ra
                 axs[0].axis('off')
                 
                 axs[1].imshow(eroded_mask, cmap='gray')
-                axs[1].set_title(f"Eroded Subregion")
+                axs[1].set_title("Eroded Subregion")
                 axs[1].axis('off')
                 
                 plt.show()
@@ -252,7 +258,7 @@ def process_nd2_pair(fluorescence_path, cars_path):
     summary = []
 
     # Determine which fluorescence channel to process based on filename
-    target_channel_index = 1;
+    target_channel_index = 1
 
     with ND2Reader(fluorescence_path) as fluoro_nd2, ND2Reader(cars_path) as cars_nd2:
         print(f"File: {fluorescence_path}")
@@ -269,9 +275,6 @@ def process_nd2_pair(fluorescence_path, cars_path):
         for pos in range(fluoro_nd2.sizes['v']):
             fluoro_nd2.default_coords['v'] = pos
             cars_nd2.default_coords['v'] = pos
-    
-            fluoro_mask_stack = []
-            cars_foci_stack = []
     
             # Iterate through each z-stack
             print(f"\nProcessing Z-Stack {pos + 1}")

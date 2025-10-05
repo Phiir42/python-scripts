@@ -1,10 +1,14 @@
 # lipid_analysis/config_utils.py
+from __future__ import annotations  # <-- add this line
+
 import importlib.util
 import os
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
 
 from .path_utils import resolve_all_paths
 
+if TYPE_CHECKING:
+    from types import ModuleType
 
 def load_config(py_file_path: str) -> Dict[str, Any]:
     """
@@ -24,7 +28,7 @@ def load_config(py_file_path: str) -> Dict[str, Any]:
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load module spec for: {py_file_path}")
 
-    mod = importlib.util.module_from_spec(spec)  # type: ModuleType
+    mod: ModuleType = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
     except Exception as e:

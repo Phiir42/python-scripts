@@ -11,14 +11,16 @@ Creates / replaces the following worksheets:
     5. XY {Condition} {CellType}      (myelination vs metrics)
 """
 
+import pathlib
+import pandas as pd
+from openpyxl import load_workbook
+from typing import Optional
+from pathlib import Path
+
 # ── USER SETTINGS ─────────────────────────────────────────────────────────────
 INPUT_FILE  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD Lipid Statistics.xlsx"   # ← edit to your aggregated file
 OUTPUT_FILE = None        # leave None to get “…_prism.xlsx” in same folder
 # ──────────────────────────────────────────────────────────────────────────────
-
-import pathlib
-import pandas as pd
-from openpyxl import load_workbook
 
 # ── CONSTANTS ────────────────────────────────────────────────────────────────
 CELL_TYPES = ["Microglia", "Astrocytes", "Neurons"]
@@ -302,13 +304,18 @@ def _write_df_simple(ws, df: pd.DataFrame):
             ws.cell(row=r, column=c, value=val)
 
 
+def _as_path(p: Optional[str]) -> Path:
+    if p is None:
+        raise ValueError("Expected a file path, got None (did you cancel the file chooser?)")
+    return Path(p)
+
 
 def main() -> None:
-    in_path = pathlib.Path(INPUT_FILE).expanduser().resolve()
+    in_path = _as_path(INPUT_FILE).expanduser().resolve()
     if not in_path.is_file():
         raise FileNotFoundError(f"Input file not found: {in_path}")
     out_path = (
-        pathlib.Path(OUTPUT_FILE).expanduser().resolve()
+        _as_path(OUTPUT_FILE).expanduser().resolve()
         if OUTPUT_FILE
         else in_path.with_name(in_path.stem + "_prism.xlsx")
     )

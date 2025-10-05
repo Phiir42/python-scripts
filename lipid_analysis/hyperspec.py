@@ -269,7 +269,7 @@ def infer_hyperspectral_mapping(spectrum_folder, config):
         if m:
             sample_token = m.group(1).upper()
     except Exception:
-        sample_token = None
+        pass
 
     name_l = folder_base.lower()
 
@@ -477,7 +477,7 @@ def process_hyperspectral_series(
         if m:
             sample_token = m.group(1).upper()
     except Exception:
-        sample_token = None
+        sample_token
 
     cfg_map = config.get("hyperspectral_mapping", {})
     print("Available hyperspectral_mapping keys:", list(cfg_map.keys()))

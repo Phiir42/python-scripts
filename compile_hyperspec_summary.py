@@ -18,21 +18,25 @@ Usage
 python compile_hyperspec_summary.py --data-root <dir> --out <dir> [--make-plots] [--dry-run]
 """
 
+from __future__ import annotations
+
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Callable, cast
 
 import numpy as np
 import pandas as pd
 
 try:
-    import matplotlib.pyplot as plt
+    import matplotlib.pyplot as _plt  # type: ignore
+    plt: Optional[Any] = _plt  # treat pyplot as Any for mypy-friendly calls
 except Exception:
     plt = None
 
 try:
-    from scipy.stats import chi2_contingency
+    from scipy.stats import chi2_contingency as _chi2  # type: ignore
+    chi2_contingency: Optional[Callable[[np.ndarray], Tuple[Any, Any, Any, Any]]] = _chi2
 except Exception:
     chi2_contingency = None
 
@@ -41,36 +45,54 @@ except Exception:
 
 DEFAULT_CONDITION = "Unknown"
 
-def infer_condition_from_path(path_like) -> str:
+
+def infer_condition_from_path(path_like: str | Path) -> str:
     s = str(path_like)
     s = s.replace("\\", "/")
     # treat underscores/dashes as separators
     s = re.sub(r"[_-]+", " ", s)
 
-    if re.search(r"(?i)\bAD\s*3\s*3\b|\bAD\s*33\b|\bAPOE\s*3\s*/\s*3\b|\bAPOE\s*33\b|\bE3\s*E3\b", s):
+    if re.search(
+        r"(?i)\bAD\s*3\s*3\b|\bAD\s*33\b|\bAPOE\s*3\s*/\s*3\b|\bAPOE\s*33\b|\bE3\s*E3\b", s
+    ):
         return "AD APOE 3/3"
-    if re.search(r"(?i)\bAD\s*4\s*4\b|\bAD\s*44\b|\bAPOE\s*4\s*/\s*4\b|\bAPOE\s*44\b|\bE4\s*E4\b", s):
+    if re.search(
+        r"(?i)\bAD\s*4\s*4\b|\bAD\s*44\b|\bAPOE\s*4\s*/\s*4\b|\bAPOE\s*44\b|\bE4\s*E4\b", s
+    ):
         return "AD APOE 4/4"
     if re.search(r"(?i)\bCTRL\b|\bCONTROL\b|\bHC\b|\bHEALTHY\s*CONTROL\b", s):
         return "Healthy Control"
     # folder shorthands like AD3a/AD4b
     parts = [p.lower() for p in Path(s).parts]
-    if any(re.fullmatch(r"ad3[a-z]?", p) for p in parts): return "AD APOE 3/3"
-    if any(re.fullmatch(r"ad4[a-z]?", p) for p in parts): return "AD APOE 4/4"
-    if any(p in {"ctrl", "control", "hc"} for p in parts): return "Healthy Control"
+    if any(re.fullmatch(r"ad3[a-z]?", p) for p in parts):
+        return "AD APOE 3/3"
+    if any(re.fullmatch(r"ad4[a-z]?", p) for p in parts):
+        return "AD APOE 4/4"
+    if any(p in {"ctrl", "control", "hc"} for p in parts):
+        return "Healthy Control"
     return DEFAULT_CONDITION
 
 
-COL_ALIASES = {
+COL_ALIASES: Dict[str, List[str]] = {
     "droplet_id": ["DropletID", "Lipid ID", "droplet_id", "object_id", "id", "dropletid", "lipidid"],
     "location": ["Location", "location", "compartment", "intra_extra", "intracellular_extracellular"],
     "cell_type": ["Cell Marker", "cell marker", "cell_type", "cell", "marker", "cell_marker", "celltype"],
-    "lamp2": ["LAMP2_Coloc", "LAMP2 Coloc", "lamp2", "lamp2_coloc", "lamp2 colocalized",
-              "lamp2_colocalized", "lamp2_colocalisation", "lamp2_flag", "lamp2 coloc", "lamp2_coloc."],
+    "lamp2": [
+        "LAMP2_Coloc",
+        "LAMP2 Coloc",
+        "lamp2",
+        "lamp2_coloc",
+        "lamp2 colocalized",
+        "lamp2_colocalized",
+        "lamp2_colocalisation",
+        "lamp2_flag",
+        "lamp2 coloc",
+        "lamp2_coloc.",
+    ],
     "classification": ["class_label", "classification", "class", "label", "final_class", "droplet_class"],
 }
 
-TRUE_TOKENS = {"1", "true", "t", "yes", "y", "coloc", "colocalized", "colocalised"}
+TRUE_TOKENS: set[str] = {"1", "true", "t", "yes", "y", "coloc", "colocalized", "colocalised"}
 
 
 def pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -80,7 +102,7 @@ def pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optio
         if cand.lower() in cols_lower:
             return cols_lower[cand.lower()]
     # fuzzy: strip spaces/underscores
-    normalized = {re.sub(r"[\s_]+", "", c.lower()): c for c in df.columns}
+    normalized = {re.sub(r"[\s_]+", "", str(c).lower()): str(c) for c in df.columns}
     for cand in candidates:
         key = re.sub(r"[\s_]+", "", cand.lower())
         if key in normalized:
@@ -88,7 +110,7 @@ def pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optio
     return None
 
 
-def normalize_lamp2(value) -> Optional[bool]:
+def normalize_lamp2(value: Any) -> Optional[bool]:
     if pd.isna(value):
         return None
     if isinstance(value, (int, float)):
@@ -105,19 +127,23 @@ def normalize_lamp2(value) -> Optional[bool]:
     return None
 
 
-def _read_sheet_safe(xls, name):
+def _read_sheet_safe(xls: pd.ExcelFile, name: str) -> Optional[pd.DataFrame]:
     try:
         return pd.read_excel(xls, sheet_name=name)
     except Exception:
         return None
 
 
-def _merge_meta(base: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+def _merge_meta(base: pd.DataFrame, meta: Optional[pd.DataFrame]) -> pd.DataFrame:
     if meta is None or meta.empty:
         return base
 
-    id_col_base = pick_first_existing_column(base, ["DropletID", "Lipid ID", "droplet_id", "dropletid", "lipidid", "id"])
-    id_col_meta = pick_first_existing_column(meta, ["DropletID", "Lipid ID", "droplet_id", "dropletid", "lipidid", "id"])
+    id_col_base = pick_first_existing_column(
+        base, ["DropletID", "Lipid ID", "droplet_id", "dropletid", "lipidid", "id"]
+    )
+    id_col_meta = pick_first_existing_column(
+        meta, ["DropletID", "Lipid ID", "droplet_id", "dropletid", "lipidid", "id"]
+    )
     if id_col_base is None or id_col_meta is None:
         return base
 
@@ -128,16 +154,22 @@ def _merge_meta(base: pd.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
     cell_col = pick_first_existing_column(rhs, COL_ALIASES["cell_type"])
     lamp_col = pick_first_existing_column(rhs, COL_ALIASES["lamp2"])
 
-    keep = {id_col_meta}
-    if loc_col: keep.add(loc_col)
-    if cell_col: keep.add(cell_col)
-    if lamp_col: keep.add(lamp_col)
+    keep: set[str] = {id_col_meta}
+    if loc_col:
+        keep.add(loc_col)
+    if cell_col:
+        keep.add(cell_col)
+    if lamp_col:
+        keep.add(lamp_col)
     rhs2 = rhs[list(keep)].copy()
 
-    rename_map = {}
-    if loc_col: rename_map[loc_col] = "_meta_location"
-    if cell_col: rename_map[cell_col] = "_meta_cell_type"
-    if lamp_col: rename_map[lamp_col] = "_meta_lamp2"
+    rename_map: Dict[str, str] = {}
+    if loc_col:
+        rename_map[loc_col] = "_meta_location"
+    if cell_col:
+        rename_map[cell_col] = "_meta_cell_type"
+    if lamp_col:
+        rename_map[lamp_col] = "_meta_lamp2"
     rhs2 = rhs2.rename(columns=rename_map)
 
     merged = pd.merge(lhs, rhs2, left_on=id_col_base, right_on=id_col_meta, how="left")
@@ -177,7 +209,7 @@ def load_classification_sheet(xlsx_path: Path) -> pd.DataFrame:
     # DropletID first…
     c_id = pick_first_existing_column(dfC, COL_ALIASES["droplet_id"])
     out["DropletID"] = dfC[c_id] if c_id else np.arange(len(dfC))
-    
+
     # now broadcast scalars
     out["file"] = str(xlsx_path)
     out["condition"] = infer_condition_from_path(xlsx_path)
@@ -194,7 +226,9 @@ def load_classification_sheet(xlsx_path: Path) -> pd.DataFrame:
 
     c_class = pick_first_existing_column(dfC, COL_ALIASES["classification"])
     if not c_class:
-        raise ValueError(f"Could not find a 'classification' column in {xlsx_path} (sheet: {sheet_to_read}).")
+        raise ValueError(
+            f"Could not find a 'classification' column in {xlsx_path} (sheet: {sheet_to_read})."
+        )
     out["classification"] = dfC[c_class].astype(str).str.strip()
 
     # Merge missing metadata from Peak Fits then Raw Data
@@ -211,7 +245,7 @@ def load_classification_sheet(xlsx_path: Path) -> pd.DataFrame:
 
 
 def aggregate_distributions(tidy: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    results = {}
+    results: Dict[str, pd.DataFrame] = {}
 
     df = tidy.copy()
     df["cell_type"] = df["cell_type"].fillna("unspecified").replace({"nan": "unspecified"})
@@ -221,40 +255,40 @@ def aggregate_distributions(tidy: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
     counts = (
         df.groupby(["condition", "cell_type", "classification"], dropna=False)
-          .size()
-          .rename("count")
-          .reset_index()
+        .size()
+        .rename("count")
+        .reset_index()
     )
     results["counts_by_cond_cell_class"] = counts
 
     total_per_cond_cell = counts.groupby(["condition", "cell_type"])["count"].transform("sum")
     pct_class_given_cond_cell = counts.copy()
-    pct_class_given_cond_cell["pct"] = np.where(total_per_cond_cell > 0,
-                                                counts["count"] / total_per_cond_cell,
-                                                np.nan)
+    pct_class_given_cond_cell["pct"] = np.where(
+        total_per_cond_cell > 0, counts["count"] / total_per_cond_cell, np.nan
+    )
     results["pct_class_given_cond_cell"] = pct_class_given_cond_cell
 
     total_per_class = counts.groupby(["classification"])["count"].transform("sum")
     pct_cond_cell_given_class = counts.copy()
-    pct_cond_cell_given_class["pct"] = np.where(total_per_class > 0,
-                                                counts["count"] / total_per_class,
-                                                np.nan)
+    pct_cond_cell_given_class["pct"] = np.where(
+        total_per_class > 0, counts["count"] / total_per_class, np.nan
+    )
     results["pct_cond_cell_given_class"] = pct_cond_cell_given_class
 
     overall = (
         df.groupby(["condition", "classification"], dropna=False)
-          .size()
-          .rename("count")
-          .reset_index()
+        .size()
+        .rename("count")
+        .reset_index()
     )
     results["overall_counts_by_cond_class"] = overall
 
-    lamp2_df = df[df["lamp2"] == True].copy()
+    lamp2_df = df[df["lamp2"]].copy()
     L_counts = (
         lamp2_df.groupby(["condition", "classification"], dropna=False)
-                .size()
-                .rename("count")
-                .reset_index()
+        .size()
+        .rename("count")
+        .reset_index()
     )
     results["LAMP2_counts_by_cond_class"] = L_counts
 
@@ -267,31 +301,42 @@ def aggregate_distributions(tidy: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 def chi_square_tests(results: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    out = {}
+    out: Dict[str, pd.DataFrame] = {}
     if chi2_contingency is None:
         return out
 
     overall = results["overall_counts_by_cond_class"]
     if not overall.empty:
-        overall_pivot = overall.pivot_table(index="condition", columns="classification", values="count", fill_value=0)
+        overall_pivot = overall.pivot_table(
+            index="condition", columns="classification", values="count", fill_value=0
+        )
         if overall_pivot.shape[0] > 1 and overall_pivot.shape[1] > 1:
             chi2, p, dof, expected = chi2_contingency(overall_pivot.values)
-            out["overall_condition_vs_classification"] = pd.DataFrame({"chi2": [chi2], "p_value": [p], "dof": [dof]})
+            out["overall_condition_vs_classification"] = pd.DataFrame(
+                {"chi2": [chi2], "p_value": [p], "dof": [dof]}
+            )
 
     L_counts = results.get("LAMP2_counts_by_cond_class", pd.DataFrame())
     if not L_counts.empty:
-        L_pivot = L_counts.pivot_table(index="condition", columns="classification", values="count", fill_value=0)
+        L_pivot = L_counts.pivot_table(
+            index="condition", columns="classification", values="count", fill_value=0
+        )
         if L_pivot.shape[0] > 1 and L_pivot.shape[1] > 1 and L_pivot.values.sum() > 0:
             chi2, p, dof, expected = chi2_contingency(L_pivot.values)
-            out["lamp2_condition_vs_classification"] = pd.DataFrame({"chi2": [chi2], "p_value": [p], "dof": [dof]})
+            out["lamp2_condition_vs_classification"] = pd.DataFrame(
+                {"chi2": [chi2], "p_value": [p], "dof": [dof]}
+            )
 
     return out
 
 
-def make_plots(results: Dict[str, pd.DataFrame], out_dir: Path):
+def make_plots(results: Dict[str, pd.DataFrame], out_dir: Path) -> None:
     if plt is None:
         print("matplotlib is not available; skipping plots.")
         return
+
+    # Treat pyplot as Any for mypy to accept .figure/.bar/etc.
+    _plt_any = cast(Any, plt)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,15 +346,15 @@ def make_plots(results: Dict[str, pd.DataFrame], out_dir: Path):
             classes = sub["classification"].tolist()
             pct = sub["pct"].fillna(0).values
 
-            fig = plt.figure()
-            plt.bar(range(len(classes)), pct)
-            plt.xticks(range(len(classes)), classes, rotation=45, ha="right")
-            plt.ylabel("P(class | condition, cell_type)")
-            plt.title(f"{cond} — {cell}")
-            plt.tight_layout()
-            fig_path = out_dir / f"pct_class_given_{slug(cond)}_{slug(cell)}.png"
-            plt.savefig(fig_path, dpi=150)
-            plt.close(fig)
+            fig = _plt_any.figure()
+            _plt_any.bar(range(len(classes)), pct)
+            _plt_any.xticks(range(len(classes)), classes, rotation=45, ha="right")
+            _plt_any.ylabel("P(class | condition, cell_type)")
+            _plt_any.title(f"{cond} — {cell}")
+            _plt_any.tight_layout()
+            fig_path = out_dir / f"pct_class_given_{slug(str(cond))}_{slug(str(cell))}.png"
+            _plt_any.savefig(fig_path, dpi=150)
+            _plt_any.close(fig)
 
     L = results["LAMP2_pct_class_given_cond"]
     if not L.empty:
@@ -317,27 +362,43 @@ def make_plots(results: Dict[str, pd.DataFrame], out_dir: Path):
             classes = sub["classification"].tolist()
             pct = sub["pct"].fillna(0).values
 
-            fig = plt.figure()
-            plt.bar(range(len(classes)), pct)
-            plt.xticks(range(len(classes)), classes, rotation=45, ha="right")
-            plt.ylabel("P(class | condition) — LAMP2 only")
-            plt.title(f"{cond}")
-            plt.tight_layout()
-            fig_path = out_dir / f"lamp2_pct_class_given_{slug(cond)}.png"
-            plt.savefig(fig_path, dpi=150)
-            plt.close(fig)
+            fig = _plt_any.figure()
+            _plt_any.bar(range(len(classes)), pct)
+            _plt_any.xticks(range(len(classes)), classes, rotation=45, ha="right")
+            _plt_any.ylabel("P(class | condition) — LAMP2 only")
+            _plt_any.title(f"{cond}")
+            _plt_any.tight_layout()
+            fig_path = out_dir / f"lamp2_pct_class_given_{slug(str(cond))}.png"
+            _plt_any.savefig(fig_path, dpi=150)
+            _plt_any.close(fig)
 
 
 def slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Compile hyperspectral droplet classifications across workbooks.")
-    ap.add_argument("--data-root", type=Path, required=True, help="Root directory to search for Hyperspectral_Results_*.xlsx files.")
-    ap.add_argument("--out", type=Path, required=True, help="Directory to write outputs (CSVs and optional plots).")
-    ap.add_argument("--make-plots", action="store_true", help="If set, save basic bar charts (matplotlib).")
-    ap.add_argument("--dry-run", action="store_true", help="If set, print which files would be processed and exit.")
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Compile hyperspectral droplet classifications across workbooks."
+    )
+    ap.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+        help="Root directory to search for Hyperspectral_Results_*.xlsx files.",
+    )
+    ap.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Directory to write outputs (CSVs and optional plots).",
+    )
+    ap.add_argument(
+        "--make-plots", action="store_true", help="If set, save basic bar charts (matplotlib)."
+    )
+    ap.add_argument(
+        "--dry-run", action="store_true", help="If set, print which files would be processed and exit."
+    )
     args = ap.parse_args()
 
     xlsx_files = sorted(args.data_root.rglob("Hyperspectral_Results_*.xlsx"))
@@ -351,7 +412,7 @@ def main():
         print("No Hyperspectral_Results_*.xlsx files found under:", args.data_root)
         return
 
-    all_rows = []
+    all_rows: List[pd.DataFrame] = []
     for path in xlsx_files:
         try:
             df = load_classification_sheet(path)
@@ -364,10 +425,10 @@ def main():
         return
 
     tidy = pd.concat(all_rows, ignore_index=True)
-    
+
     # Debug: show a few paths whose condition stayed Unknown
     unknown_mask = tidy["condition"].eq("Unknown")
-    if unknown_mask.any():
+    if bool(unknown_mask.any()):
         print("[DEBUG] Example paths with Unknown condition:")
         for p in tidy.loc[unknown_mask, "file"].head(10):
             print("  ", p)
