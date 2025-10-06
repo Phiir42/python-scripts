@@ -10,6 +10,7 @@ from .hyperspec import process_hyperspectral_series
 from .io_utils import save_results_to_excel
 from .reference import generate_reference_image
 from .runtime import capture_logs_on_failure
+from .peakfit import chi2_reset, report_chi2_summary
 
 
 def main():
@@ -113,6 +114,7 @@ def main():
 
     # 3) Hyperspectral
     hyperspectral_foci_params = config["morphology_params"]["foci_params_hyperspectral"]
+    chi2_reset()
     for folder in hyperspectral_folders:
         folder_name = os.path.basename(folder)
         label = f"hyperspectral run: {folder_name}"
@@ -123,6 +125,7 @@ def main():
             process_hyperspectral_series(
                 folder, reference_image, hyperspectral_output, hyperspectral_foci_params
             )
+    report_chi2_summary() 
 
     # 3b) Post-classify hyperspectral outputs (CH-stretch rules only)
     if not args.no_classify:

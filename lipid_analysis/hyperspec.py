@@ -460,7 +460,14 @@ def process_hyperspectral_series(
     from skimage.filters import gaussian
 
     from .analysis import max_project_fluorescence  # local import avoids circular
-    from .peakfit import _plot_peak_fit_debug, fit_cars_peaks
+    from .peakfit import (
+        _plot_peak_fit_debug,
+        fit_cars_peaks,
+        start_debug_capture,
+        finish_debug_capture,
+        chi2_add,
+    )
+
     from .visualize import debug_display_3way_segmentation
 
     assert (
@@ -468,6 +475,22 @@ def process_hyperspectral_series(
     ), "Global 'config' must be set before calling process_hyperspectral_series()."
 
     folder_base = os.path.basename(spectrum_folder)
+    
+    # --- Peak-fit debug capture (PNG + multi-page PDF, and PPTX if python-pptx is installed)
+    debug_root = os.path.join(
+        config["paths"]["data_directory"],
+        config.get("debug_output_dir", "Debug"),
+    )
+    series_debug_dir = os.path.join(debug_root, f"peakfits_{folder_base}")
+    try:
+        # Only start capture if you actually plan to show plots (PEAKFIT_DEBUG is your existing flag)
+        if PEAKFIT_DEBUG:
+            start_debug_capture(series_debug_dir)  # creates <dir>/fits.pdf and saves each plot as PNG
+    except Exception as _e:
+        if VERBOSE:
+            print("[PeakFit DEBUG] start_debug_capture failed:", _e)
+
+    
     # NEW: extract sample token from folder name (e.g., AD44, AD33, CTRL/HC)
     sample_token = None
     try:
@@ -781,27 +804,30 @@ def process_hyperspectral_series(
             # 2) Repair random zero / near-zero spikes
             y_repaired = _repair_zero_glitches(y_raw)
 
-            # 3) Normalize to unit scale for fitting (prevents scale-mismatch)
-            y_norm, scale = _normalize_row_max(y_repaired)
-
-            # 4) Fit on normalized spectrum
-            fit = fit_cars_peaks(x_cm1, y_norm, config)
-
-            # 5) keep the scale for plotting/output; DO NOT modify A1..A7 here
-            fit["_scale"] = float(scale)
+            # 3) Fit on RAW (peakfit.py handles normalization internally)
+            fit = fit_cars_peaks(x_cm1, y_repaired, config)
 
             if PEAKFIT_DEBUG:
                 _plot_peak_fit_debug(
                     x_cm1,
-                    y_repaired,
+                    y_repaired, # raw spectrum for plotting
                     fit,
                     droplet_id=r["Lipid ID"],
                     category=r["Category"],
                     location=r["Location"],
                     marker=r["Cell Marker"],
                 )
+            
+            # 4) accumulate χ² for the batch summary
+            chi2_add(
+                series_label=folder_base,
+                droplet_id=int(r["Lipid ID"]),
+                redchi=fit.get("redchi", float("nan")),
+                success=bool(fit.get("success", False)),
+                strategy=str(fit.get("strategy_used", "")),
+            )
 
-            # 6) Collect peak rows
+            # 5) Collect peak rows
             for k in range(1, 8):
                 peak_rows.append(
                     {
@@ -881,4 +907,13 @@ def process_hyperspectral_series(
     ratio_bgr = cv2.cvtColor(ratio_rgb, cv2.COLOR_RGB2BGR)
     out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
     cv2.imwrite(out_path_ratio, ratio_bgr)
+    
+    # --- Close the PDF and build PPTX for this series
+    try:
+        if PEAKFIT_DEBUG:
+            finish_debug_capture(make_pptx=True)  # also writes <dir>/fits.pptx if python-pptx is present
+    except Exception as _e:
+        if VERBOSE:
+            print("[PeakFit DEBUG] finish_debug_capture failed:", _e)
+
     print(f"Ratio heatmap saved to {out_path_ratio}")
