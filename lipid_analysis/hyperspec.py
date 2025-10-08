@@ -17,6 +17,8 @@ from .constants import CARS_CH, PEAKFIT_DEBUG, VERBOSE
 from .debug_utils import save_alignment_triptych
 from .filters import apply_east_shadows_filter
 from .segmentation import find_foci, process_fluorescence_channel
+from .myelin_analysis import detect_myelin
+from .peakfit import fit_cars_peaks, _plot_peak_fit_debug
 
 # This is intentionally set from the CLI before calling module functions.
 # e.g. in cli.py:  import lipid_analysis.hyperspec as hyperspec; hyperspec.config = config
@@ -446,6 +448,136 @@ def infer_hyperspectral_mapping(spectrum_folder, config):
     }
 
 
+def compute_myelin_average_for_series(
+    spectrum_folder: str,
+    reference_image: np.ndarray,
+    foci_params: dict,
+    myelin_params: dict | None = None,
+) -> dict:
+    """
+    NEW: Compute a myelin-only average spectrum for a hyperspectral *folder*.
+
+    - Uses the 9th wavenumber frame (index 8) to build masks, exactly like the
+      droplet detection pipeline (same pre-processing, same frame).
+    - "Other features" mask == union of all lipid droplets (which includes
+      lipofuscin / lipidated-lipofuscin objects as subsets).
+    - Returns one dict row with fitted peak parameters and a few QA fields.
+    """
+    myelin_params = myelin_params or {}
+    # 1) Gather ND2s in this hyperspectral folder and sort by wavenumber from filename.
+    nd2_names = [f for f in os.listdir(spectrum_folder) if f.lower().endswith(".nd2")]
+    if not nd2_names:
+        return {"Series": os.path.basename(spectrum_folder), "Error": "No ND2 files"}
+
+    # Extract approximate cm^-1 from filename; fallback keeps order stable.
+    def _extract_cm1(name: str) -> int:
+        m = re.search(r"(\d{3,4})", name)
+        try:
+            v = int(m.group(1)) if m else -1
+        except Exception:
+            v = -1
+        return v
+
+    # Sort files the same way as process_hyperspectral_series (by trailing index)
+    def _num_key(p):
+        m = re.search(r"(\d+)(?=\.nd2$)", os.path.basename(p))
+        return int(m.group(1)) if m else p
+
+    nd2_names = sorted(nd2_names, key=_num_key)
+    nd2_paths = [os.path.join(spectrum_folder, n) for n in nd2_names]
+
+    # Build wavenumbers exactly like the droplet code path
+    def _compute_wavenumber(lambda_nm: float) -> float:
+        return 1.0e7 * ((1.0 / lambda_nm) - (1.0 / 1031.0))
+
+    wavelengths_nm = [801.0 - 0.5 * i for i in range(32)]
+    wavenumbers = np.array([_compute_wavenumber(wl) for wl in wavelengths_nm], dtype=float)
+
+    # Sanity check: CH stretch should be ~2780–3040 cm^-1
+    if not (2700 <= float(np.min(wavenumbers)) <= 3045 and 2700 <= float(np.max(wavenumbers)) <= 3100):
+        print(f"[WARN] myelin wavenumbers look off: {float(np.min(wavenumbers)):.1f}–{float(np.max(wavenumbers)):.1f} cm^-1")
+
+    # 2) Build corrected hyperspectral stack (N, H, W): East-shadows + reference division.
+    stack_corr: list[np.ndarray] = []
+    for p in nd2_paths:
+        with ND2Reader(p) as nd2:
+            nd2.iter_axes = ""  # single plane expected
+            raw = np.nan_to_num(nd2.get_frame_2D(c=CARS_CH))
+        raw = apply_east_shadows_filter(raw)
+        den = np.clip(reference_image, 1e-6, None)
+        stack_corr.append(raw / den)
+    stack = np.asarray(stack_corr, dtype=float)  # shape: (N, H, W)
+    if stack.ndim != 3 or stack.shape[0] < 9:
+        return {"Series": os.path.basename(spectrum_folder), "Error": "Unexpected stack shape"}
+
+    # 3) 9th frame => masks
+    base9 = stack[8]  # 0-based index for "9th" wavenumber frame
+
+    # 3a) "Other features" mask (lipids incl. lipofuscin & lipidated-lipofuscin):
+    #     identical to droplet-finding pipeline (find_foci on 9th frame).
+    droplet_mask = find_foci(
+        base9,
+        sigma=float(foci_params.get("sigma", 1.0) or 0.0),
+        min_distance=int(foci_params.get("min_distance", 5) or 5),
+        min_size=int(foci_params.get("min_size", 20) or 20),
+        std_dev_multiplier=float(foci_params.get("std_dev_multiplier", 3.5) or 3.5),
+        remove_saturated=bool(foci_params.get("remove_saturated", True)),
+        saturation_threshold=float(foci_params.get("saturation_threshold", 3500) or 3500),
+        saturated_min_size=int(foci_params.get("saturated_min_size", 50) or 50),
+        debug=bool(VERBOSE),
+    )
+
+    # 3b) Myelin mask from the same 9th frame using your myelin module.
+    my_mask, my_frac = detect_myelin(
+        base9,
+        gaussian_sigma=float(myelin_params.get("gaussian_sigma", 1.0) or 1.0),
+        threshold_method=str(myelin_params.get("threshold_method", "otsu") or "otsu"),
+        offset=float(myelin_params.get("offset", 0.7) or 0.7),
+        min_size=int(myelin_params.get("min_size", 200) or 200),
+        closing_radius=int(myelin_params.get("closing_radius", 2) or 2),
+        debug=bool(myelin_params.get("debug", False)),
+    )
+
+    # 3c) Subtract out all other features.
+    keep_mask = np.logical_and(my_mask, ~droplet_mask)
+    n_pix = int(np.count_nonzero(keep_mask))
+    if n_pix == 0:
+        return {"Series": os.path.basename(spectrum_folder), "Error": "Empty myelin-minus-droplets mask"}
+
+    # 4) Average spectrum over remaining pixels (one mean per wavenumber).
+    y = np.array([np.nanmean(frame[keep_mask]) for frame in stack], dtype=float)
+
+    # 5) Match droplet path: repair glitches and fit on **RAW** (fit_cars_peaks normalizes internally).
+    y_repaired = _repair_zero_glitches(y)
+    y_norm, scale = _normalize_row_max(y_repaired)  # keep for QA, not used by the fitter
+
+    # 6) Fit using the SAME routine as droplets (identical components/params).
+    series = os.path.basename(spectrum_folder)
+    fit = fit_cars_peaks(wavenumbers, y_repaired, config)  # <-- only 3 args
+
+    # 6b) Debug plot via the SAME helper (signature: x, y_raw, fit_dict, droplet_id, category, location, marker).
+    if PEAKFIT_DEBUG:
+        _plot_peak_fit_debug(
+            wavenumbers,
+            y_repaired,           # raw spectrum for plotting
+            fit,                  # the full fit dict (contains y_fit, params, etc.)
+            droplet_id=-1,        # sentinel ID to distinguish from real droplets
+            category="Avg-Myelin",
+            location="N/A",
+            marker="",
+        )
+
+    # 7) QA metadata (fit is already a dict of parameters like x1..A1..w1..)
+    row = dict(fit)
+    row.update({
+        "Series": series,
+        "MyelinMaskFraction": float(np.count_nonzero(my_mask)) / float(my_mask.size),
+        "PixelsUsed": int(np.count_nonzero(keep_mask)),
+        "NormScale": float(scale),
+    })
+    return row
+
+
 def process_hyperspectral_series(
     spectrum_folder, reference_image, output_path, foci_params
 ):
@@ -464,7 +596,6 @@ def process_hyperspectral_series(
         _plot_peak_fit_debug,
         fit_cars_peaks,
         start_debug_capture,
-        finish_debug_capture,
         chi2_add,
     )
 
@@ -907,13 +1038,5 @@ def process_hyperspectral_series(
     ratio_bgr = cv2.cvtColor(ratio_rgb, cv2.COLOR_RGB2BGR)
     out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
     cv2.imwrite(out_path_ratio, ratio_bgr)
-    
-    # --- Close the PDF and build PPTX for this series
-    try:
-        if PEAKFIT_DEBUG:
-            finish_debug_capture(make_pptx=True)  # also writes <dir>/fits.pptx if python-pptx is present
-    except Exception as _e:
-        if VERBOSE:
-            print("[PeakFit DEBUG] finish_debug_capture failed:", _e)
 
     print(f"Ratio heatmap saved to {out_path_ratio}")

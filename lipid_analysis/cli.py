@@ -6,11 +6,12 @@ from . import constants
 from .analysis import process_nd2_pair
 from .config_utils import load_config
 from .filepairing import find_nd2_files
-from .hyperspec import process_hyperspectral_series
+from .hyperspec import process_hyperspectral_series, compute_myelin_average_for_series
 from .io_utils import save_results_to_excel
+import pandas as pd
 from .reference import generate_reference_image
 from .runtime import capture_logs_on_failure
-from .peakfit import chi2_reset, report_chi2_summary
+from .peakfit import chi2_reset, report_chi2_summary, finish_debug_capture
 
 
 def main():
@@ -115,6 +116,8 @@ def main():
     # 3) Hyperspectral
     hyperspectral_foci_params = config["morphology_params"]["foci_params_hyperspectral"]
     chi2_reset()
+    myelin_rows = []
+    
     for folder in hyperspectral_folders:
         folder_name = os.path.basename(folder)
         label = f"hyperspectral run: {folder_name}"
@@ -125,7 +128,33 @@ def main():
             process_hyperspectral_series(
                 folder, reference_image, hyperspectral_output, hyperspectral_foci_params
             )
+            # --- NEW: compute myelin-minus-droplets avg spectrum & fit it
+            myelin_row = compute_myelin_average_for_series(
+                folder,
+                reference_image,
+                hyperspectral_foci_params,
+                config.get("myelin_params", {}),
+            )
+            if myelin_row:
+                myelin_row["Folder"] = folder_name
+                myelin_rows.append(myelin_row)
+                
+            # --- Close the peak-fit debug capture AFTER myelin so all plots land in one PDF/PPTX
+            try:
+                if constants.PEAKFIT_DEBUG:
+                    finish_debug_capture(make_pptx=True)
+            except Exception as _e:
+                if constants.VERBOSE:
+                    print("[PeakFit DEBUG] finish_debug_capture (CLI) failed:", _e)
     report_chi2_summary() 
+    
+    if myelin_rows:
+        out_xlsx = os.path.join(DIRECTORY, "Hyperspectral_Myelin_AverageFits.xlsx")
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+            pd.DataFrame(myelin_rows).to_excel(
+                w, sheet_name="Myelin_Average_Fits", index=False
+            )
+        print(f"[myelin] Wrote per-series myelin average fits → {out_xlsx}")
 
     # 3b) Post-classify hyperspectral outputs (CH-stretch rules only)
     if not args.no_classify:
