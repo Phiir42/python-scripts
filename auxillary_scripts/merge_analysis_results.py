@@ -16,10 +16,11 @@ Usage:
 """
 
 import pathlib
+import re
 import pandas as pd
 
 # ── USER SETTINGS ─────────────────────────────────────────────────────────────
-PARENT_DIR = pathlib.Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025")  # edit as needed
+PARENT_DIR = pathlib.Path(r"D:\OneDrive - Stanford\Research Documents\AD Project\2025")  # edit as needed
 OUTPUT_FILE = PARENT_DIR / "AD Lipid Statistics.xlsx"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -33,10 +34,38 @@ CELL_MAP = {
     "TUJ": "Neurons",
 }
 
-# Prepare an accumulator for each output sheet
-sheet_accumulator: dict[str, list[pd.Series]] = {
-    f"{cond} {ctype}": [] for cond in CONDITIONS for ctype in CELL_MAP.values()
-}
+# --- Robust condition + cell-marker inference (case/format tolerant) ---
+_RE_CTRL = re.compile(r"(?<![A-Za-z0-9])Control(?![A-Za-z0-9])", re.IGNORECASE)
+_RE_AD33 = re.compile(r"(?<![A-Za-z0-9])AD33(?![A-Za-z0-9])", re.IGNORECASE)
+_RE_AD44 = re.compile(r"(?<![A-Za-z0-9])AD44(?![A-Za-z0-9])", re.IGNORECASE)
+
+def infer_condition(fname: str) -> str | None:
+    if _RE_AD33.search(fname): return "AD33"
+    if _RE_AD44.search(fname): return "AD44"
+    if _RE_CTRL.search(fname): return "Control"
+    return None
+
+CELL_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"IBA1", re.IGNORECASE), "Microglia"),
+    (re.compile(r"GFAP", re.IGNORECASE), "Astrocytes"),
+    (re.compile(r"(MAP2|MAP-?2|MAP2_Sigma)", re.IGNORECASE), "Neurons"),
+    (re.compile(r"(TUJ|TUJ[_-]?Ck)", re.IGNORECASE), "Neurons"),
+]
+
+def infer_cell_type(cell_marker: str) -> str | None:
+    if not isinstance(cell_marker, str):
+        return None
+    for pat, ctype in CELL_RULES:
+        if pat.search(cell_marker):
+            return ctype
+    return None
+
+# Prepare an accumulator for exactly 9 sheets (3 conditions × 3 cell types)
+SHEETS = [f"{cond} {ctype}" for cond in CONDITIONS for ctype in ["Microglia","Astrocytes","Neurons"]]
+sheet_accumulator: dict[str, list[pd.Series]] = {name: [] for name in SHEETS}
+
+# Track the union of all columns we see across all Summary sheets
+all_cols: set[str] = set()
 
 # Iterate subfolders
 for subdir in PARENT_DIR.iterdir():
@@ -54,35 +83,40 @@ for subdir in PARENT_DIR.iterdir():
         print(f"  Error reading Summary sheet: {e}")
         continue
 
-    # Route each row
+    # Route each row (robust to variants)
     for _, row in df_summary.iterrows():
-        fname = str(row.get("file_name", ""))
+        fname = str(row.get("file_name", "") or "").strip()
         cmarker = row.get("cell_marker", "")
 
-        # Determine condition
-        cond = next((c for c in CONDITIONS if c in fname), None)
+        cond = infer_condition(fname)
         if cond is None:
-            print(f"  Warning: no condition match in '{fname}'")
+            print(f"  [WARN] No condition match in file_name: '{fname}'")
             continue
 
-        # Determine cell type
-        ctype = CELL_MAP.get(cmarker)
+        ctype = infer_cell_type(cmarker)
         if ctype is None:
-            print(f"  Warning: unrecognized cell_marker '{cmarker}'")
+            print(f"  [WARN] Unrecognized cell_marker '{cmarker}' (file: '{fname}')")
             continue
 
-        # Append row to appropriate accumulator list
         sheet_name = f"{cond} {ctype}"
         sheet_accumulator[sheet_name].append(row)
+        all_cols.update(row.index.astype(str))
 
-# Build output workbook
+# Build output workbook with a consistent schema across sheets
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    # Stable column order: put file_name and cell_marker first if they exist
+    ordered = list(all_cols) if all_cols else ["file_name", "cell_marker"]
+    for pref in ("file_name", "cell_marker"):
+        if pref in ordered:
+            ordered.remove(pref)
+            ordered.insert(0, pref)
+
     for sheet_name, rows in sheet_accumulator.items():
         if rows:
             out_df = pd.DataFrame(rows)
+            out_df = out_df.reindex(columns=ordered)
         else:
-            # If no data, create an empty DataFrame with no rows
-            out_df = pd.DataFrame(columns=["file_name", "cell_marker"])
+            out_df = pd.DataFrame(columns=ordered)
 
         out_df.to_excel(writer, sheet_name=sheet_name, index=False)
 

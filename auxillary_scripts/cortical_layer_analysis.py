@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
@@ -10,98 +11,83 @@ SUBCOLUMNS = [
     "Amyloid"
 ]
 
+# Only these acquisition files are eligible for cortical-layer stratification.
+# All other files should NOT be layer-mapped and will be skipped.
+LAYERED_FILES = {
+    # Microglia / Astrocytes — S0536
+    "Control-S0536-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "Control-S0536-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # AD33 S2143
+    "AD33-S2143-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "AD33-S2143-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # AD44 S1342
+    "AD44-S1342-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "AD44-S1342-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # Control TUJ/LAMP2 S0536
+    "Control-S0536-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
+
+    # AD33 S2146
+    "AD33-S2146-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "AD33-S2146-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # AD44 S1563
+    "AD44-S1563-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "AD44-S1563-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # Control S2302
+    "Control-S2302-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
+    "Control-S2302-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
+
+    # TUJ/LAMP2 sets with normal mapping
+    "AD33-S2146-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
+    "AD44-S1563-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
+    "Control-S2302-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
+}
+
 def determine_layer(file_name, z_stack):
     """
-    Determines which layer (1..7) a given z_stack belongs to,
-    based on the skip logic you provided.
+    Map z-slice index to cortical layer using a default 6-slices-per-layer bucketing,
+    but ONLY for allowed acquisition files. Three files have special offsets
+    (skip early layers). All other files are not layer-stratified and are skipped.
+    Returns 1..7 (Layer I..VI, White Matter) or None if not applicable/invalid.
     """
-    normal_files = {
-        "Control-S0536-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "Control-S0536-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "AD33-S2143-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "AD33-S2143-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "AD44-S1342-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "AD44-S1342-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "Control-S0536-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
-        "AD33-S2146-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "AD33-S2146-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "AD44-S1563-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "AD44-S1563-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "Control-S2302-DAPI-IBA1-GFAP-100X-StacksMicroglia.nd2",
-        "Control-S2302-DAPI-IBA1-GFAP-100X-StacksAstrocytes.nd2",
-        "AD33-S2146-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
-        "AD44-S1563-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2",
-        "Control-S2302-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2"
+    # Normalize to basename to avoid path mismatches
+    base = os.path.basename(str(file_name)).strip()
+
+    # Special files that skip early layers (your original exceptions)
+    OFFSETS = {
+        "AD44-S1342-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2": 1,  # skip L1
+        "AD33-S2143-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2": 2,  # skip L1,L2
+        "Control-S2218-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2": 3,  # skip L1–L3
     }
 
-    ad44_tuj_lamp2 = "AD44-S1342-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2"
-    ad33_tuj_lamp2 = "AD33-S2143-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2"
-    control_s2218  = "Control-S2218-DAPI-TUJ-LAMP2-100X-StacksNeurons.nd2"
-
-    if file_name in normal_files:
-        # 1..6 => Layer I, 7..12 => Layer II, etc.
-        if 1 <= z_stack <= 6:
-            return 1
-        elif 7 <= z_stack <= 12:
-            return 2
-        elif 13 <= z_stack <= 18:
-            return 3
-        elif 19 <= z_stack <= 24:
-            return 4
-        elif 25 <= z_stack <= 30:
-            return 5
-        elif 31 <= z_stack <= 36:
-            return 6
-        elif 37 <= z_stack <= 42:
-            return 7
-        else:
-            return None
-
-    elif file_name == ad44_tuj_lamp2:
-        # skip Layer I
-        if 1 <= z_stack <= 6:
-            return 2
-        elif 7 <= z_stack <= 12:
-            return 3
-        elif 13 <= z_stack <= 18:
-            return 4
-        elif 19 <= z_stack <= 24:
-            return 5
-        elif 25 <= z_stack <= 30:
-            return 6
-        elif 31 <= z_stack <= 36:
-            return 7
-        else:
-            return None
-
-    elif file_name == ad33_tuj_lamp2:
-        # skip I, II, White Matter
-        if 1 <= z_stack <= 6:
-            return 3
-        elif 7 <= z_stack <= 12:
-            return 4
-        elif 13 <= z_stack <= 18:
-            return 5
-        elif 19 <= z_stack <= 24:
-            return 6
-        else:
-            return None
-
-    elif file_name == control_s2218:
-        # skip I, II, III
-        if 1 <= z_stack <= 6:
-            return 4
-        elif 7 <= z_stack <= 12:
-            return 5
-        elif 13 <= z_stack <= 18:
-            return 6
-        elif 19 <= z_stack <= 24:
-            return 7
-        else:
-            return None
-
-    else:
+    # Only proceed if this file is meant to be layer-mapped.
+    # Allowed if in the allowlist, or one of the special-offset files.
+    if base not in LAYERED_FILES and base not in OFFSETS:
         return None
+
+    # Default: 6 z-slices per layer ⇒ 1..6→L1, 7..12→L2, ..., 37..→L7 (WM)
+    def base_layer(z):
+        try:
+            z_int = int(z)
+        except (TypeError, ValueError):
+            return None
+        if z_int <= 0:
+            return None
+        L = 1 + (z_int - 1) // 6
+        return min(L, 7)
+
+    L0 = base_layer(z_stack)
+    if L0 is None:
+        return None
+
+    k = OFFSETS.get(base, 0)
+    L = L0 + k
+    return L if 1 <= L <= 7 else None
+
 
 def create_formatted_worksheet(wb, sheet_name):
     """
@@ -150,8 +136,8 @@ def create_formatted_worksheet(wb, sheet_name):
     return ws
 
 def main():
-    input_filename = "AD Lipid Statistics.xlsx"
-    output_filename = "AD_Lipid_Statistics_Reformatted.xlsx"
+    input_filename = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD Lipid Statistics.xlsx"
+    output_filename = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD_Lipid_Statistics_CorticalLayers.xlsx"
 
     xl = pd.ExcelFile(input_filename)
     sheet_names = xl.sheet_names
@@ -183,28 +169,30 @@ def main():
         # Group the data by file_name -> layer -> list of (lipids, lipid_lipo, lipo)
         grouped_data = {}
         for i, row_data in df.iterrows():
-            fn = row_data['file_name']
+            fn_raw = row_data['file_name']
+            fn = str(fn_raw).strip()                   # ← normalize once, up front
             zs = row_data['z_stack']
             pl = row_data['pure_lipid_percentage']
             llf = row_data['lipid_lipofuscin_percentage']
             lpf = row_data['lipofuscin_percentage']
             mb  = row_data['myelination_percentage']
             ap  = row_data['amyloid_percentage']
-
-            layer = determine_layer(fn, zs)
+            
+            layer = determine_layer(fn, zs)            # ← use normalized fn
             if layer is None:
+                print(f"[WARN] Skipping row (no layer): file='{fn}', z_stack={zs}")
                 continue
-
+            
             # Store in grouped_data
             if fn not in grouped_data:
                 grouped_data[fn] = {i: [] for i in range(1,8)}
-            grouped_data[fn][layer].append((pl, llf, lpf, mb, ap))
+            grouped_data[fn][layer].append((int(zs) if pd.notna(zs) else None, pl, llf, lpf, mb, ap))
 
         # Now we’ll write the data. Start from row=3 (below the headers).
         current_row = 3
 
-        # We have 7 columns of interest (Layer 1..7),
-        # each taking up 3 subcolumns => total columns from 2..22
+        # We have 7 layer blocks (Layer I..WM),
+        # each taking up len(SUBCOLUMNS)=5 subcolumns => total columns from 2..36
         def layer_to_cols(layer):
             # layer 1 => columns 2,3,4
             # layer 2 => columns 5,6,7
@@ -214,6 +202,11 @@ def main():
 
         # Write each file_name in a block
         for file_name, layer_dict in grouped_data.items():
+            # Sort within each layer by z_stack for stable row order
+            for lyr in range(1, 8):
+                layer_vals = layer_dict[lyr]
+                # keep tuples as (z, pl, llf, lpf, mb, ap)
+                layer_vals.sort(key=lambda tup: (tup[0] is None, tup[0]))
 
             # For each of the 7 layers, we have some number of data points
             # The block height = the maximum number of data points among all layers
@@ -255,7 +248,8 @@ def main():
                     cols = layer_to_cols(lyr)  # now returns 5 column indices
                     if i < len(data_points):
                         # data_points[i] is a 5-tuple: (pl, llf, lpf, mb, ap)
-                        for val, col in zip(data_points[i], cols):
+                        vals = data_points[i][1:]  # drop z
+                        for val, col in zip(vals, cols):
                             ws.cell(row=row_i, column=col, value=val)
 
             # After filling these max_points rows for this file_name,

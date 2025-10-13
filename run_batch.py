@@ -3,7 +3,7 @@ import subprocess
 import sys
 
 # --- set your run root ONCE here ---
-RUN_ROOT = Path(r"C:\Users\clchr\OneDrive - Stanford")  # the --root you want
+RUN_ROOT = Path(r"D:\OneDrive - Stanford")  # the --root you want
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 PKG_DIR = PROJECT_ROOT / "lipid_analysis"

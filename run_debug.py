@@ -11,7 +11,7 @@ if str(ROOT) not in sys.path:
 # Simulate CLI args
 sys.argv = [
     "run_debug.py",
-    "--config", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3d.py",
+    "--config", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3a.py",
     "--root", r"C:\Users\clchr\OneDrive - Stanford",
     "--verbose"
 ]

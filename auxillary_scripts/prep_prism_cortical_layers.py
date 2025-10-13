@@ -80,7 +80,12 @@ wb_in = oxl.load_workbook(INPUT_FILE, data_only=True)
 
 for cell_type in CELL_TYPES:
     for cond in CONDITIONS:
-        ws = wb_in[f"{cond} {cell_type}"]
+        sheet_name = f"{cond} {cell_type}"
+        try:
+            ws = wb_in[sheet_name]
+        except KeyError:
+            print(f"[WARN] Missing sheet: {sheet_name}")
+            continue
 
         # locate the 3×7 data columns
         col_map: dict[tuple[str, str], int] = {}
@@ -100,16 +105,19 @@ for cell_type in CELL_TYPES:
                 for rng in ws.merged_cells.ranges
                 if (
                     rng.min_col == rng.max_col == 1  # only column A
-                    and rng.min_row >= START_ROW  # skip header merge
+                    and rng.min_row >= START_ROW     # skip header merge
                 )
             ],
             key=lambda r: r.min_row,
         )
+        if not replicate_ranges:
+            print(f"[INFO] No merged replicate blocks found in column A on sheet {sheet_name}")
         rep_counts[cell_type][cond] = len(replicate_ranges)
 
         for rng in replicate_ranges:
             file_name_in_A = ws.cell(rng.min_row, 1).value
-            donor_id = str(file_name_in_A).split("-")[1]
+            parts = str(file_name_in_A).split("-")
+            donor_id = parts[1] if len(parts) >= 2 else str(file_name_in_A)
             donor_blocks[cell_type][cond].append(donor_id)
 
         # average each replicate block
@@ -117,7 +125,11 @@ for cell_type in CELL_TYPES:
             rows = range(rng.min_row, rng.max_row + 1)
             for layer in LAYERS:
                 for metric in METRICS:
-                    col = col_map[(layer, metric)]
+                    col = col_map.get((layer, metric))
+                    if col is None:
+                        print(f"[WARN] Missing header pair ({layer}, {metric}) in sheet {sheet_name}")
+                        continue
+                    
                     vals = [
                         ws.cell(r, col).value
                         for r in rows

@@ -958,8 +958,12 @@ def process_hyperspectral_series(
                 strategy=str(fit.get("strategy_used", "")),
             )
 
-            # 5) Collect peak rows
-            for k in range(1, 8):
+            # 5) Collect peak rows (include widths and any present peaks, e.g., 1..7 and optional 8 for 3010)
+            peak_indices = sorted(
+                int(k[1:]) for k in fit.keys()
+                if isinstance(k, str) and k.startswith("x") and k[1:].isdigit()
+            )
+            for k in peak_indices:
                 peak_rows.append(
                     {
                         "Lipid ID": r["Lipid ID"],
@@ -970,6 +974,7 @@ def process_hyperspectral_series(
                         "Peak": k,
                         "Center_cm^-1": fit.get(f"x{k}", np.nan),
                         "Amplitude": fit.get(f"A{k}", np.nan),
+                        "Width_cm^-1": fit.get(f"w{k}", np.nan),   # <-- NEW
                         "FitSuccess": fit.get("success", False),
                     }
                 )

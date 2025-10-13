@@ -50,13 +50,22 @@ def build_prism_dataframe(xlsx: pathlib.Path, *, remove_zeros: bool = False) -> 
         for cell in CELL_TYPES:
             for cond in CONDITIONS:
                 sheet = f"{cond} {cell}"
-                df_sheet = pd.read_excel(xlsx, sheet_name=sheet)
+                try:
+                    df_sheet = pd.read_excel(xlsx, sheet_name=sheet)
+                except Exception as e:
+                    print(f"[WARN] Missing sheet '{sheet}' ({e}); filling empty column for metric '{metric_key}'.")
+                    cols.append(pd.Series(dtype="float64", name=metric_key))
+                    continue
+
                 if metric_key in df_sheet.columns:
                     s = df_sheet[metric_key]
                 else:
+                    print(f"[WARN] Sheet '{sheet}' lacks column '{metric_key}'; filling NA.")
                     s = pd.Series([pd.NA] * len(df_sheet), name=metric_key)
+
                 if remove_zeros:
                     s = s[s != 0].reset_index(drop=True)
+
                 cols.append(s)
                 max_len = max(max_len, len(s))
 
@@ -66,27 +75,40 @@ def build_prism_dataframe(xlsx: pathlib.Path, *, remove_zeros: bool = False) -> 
 
 def build_prism_average_dataframe(xlsx: pathlib.Path, *, remove_zeros: bool = False) -> pd.DataFrame:
     series_list = []
-    donors = set()
+    donors: set[str] = set()
+
     for metric_key, _ in METRICS:
         for cell in CELL_TYPES:
             for cond in CONDITIONS:
                 sheet = f"{cond} {cell}"
-                df_full = pd.read_excel(xlsx, sheet_name=sheet)
+                try:
+                    df_full = pd.read_excel(xlsx, sheet_name=sheet)
+                except Exception as e:
+                    print(f"[WARN] Missing sheet '{sheet}' ({e}); filling NA column for averages of '{metric_key}'.")
+                    series_list.append(pd.Series(dtype="float64"))  # keep column position
+                    continue
+
+                # drop rows without a file name to avoid a NaN donor bucket
+                df_full = df_full.dropna(subset=["file_name"]).copy()
+
                 if metric_key in df_full.columns:
                     df = df_full[["file_name", metric_key]].copy()
                 else:
+                    print(f"[WARN] Sheet '{sheet}' lacks column '{metric_key}'; filling NA for averages.")
                     df = df_full[["file_name"]].copy()
                     df[metric_key] = pd.NA
+
                 if remove_zeros:
                     df.loc[df[metric_key] == 0, metric_key] = pd.NA
+
                 df["cond_donor"] = df["file_name"].map(_cond_donor_stub)
                 s = df.groupby("cond_donor", dropna=False)[metric_key].mean()
                 series_list.append(s)
-                donors.update(s.index)
+                donors.update([idx for idx in s.index if pd.notna(idx)])
 
     donor_list = sorted(donors)
-    padded = [s.reindex(donor_list) for s in series_list]
-    wide = pd.concat(padded, axis=1)
+    padded = [s.reindex(donor_list) for s in series_list] if donor_list else []
+    wide = pd.concat(padded, axis=1) if padded else pd.DataFrame(index=[])
     wide.insert(0, "cond_donor", donor_list)
     return wide
 
@@ -149,13 +171,26 @@ def add_prism_sheets(infile: pathlib.Path, outfile: pathlib.Path) -> None:
             if sheet_in not in wb.sheetnames:
                 continue
             # load the detailed sheet to get raw columns
-            df_sheet = pd.read_excel(infile, sheet_name=sheet_in)
+            try:
+                df_sheet = pd.read_excel(infile, sheet_name=sheet_in)
+            except Exception as e:
+                print(f"[WARN] Could not load sheet '{sheet_in}' for XY ({e}).")
+                continue
+
             cols = ["myelination_percentage"] + metrics_to_plot
             existing = [c for c in cols if c in df_sheet.columns]
             if "myelination_percentage" not in existing:
+                print(f"[INFO] Sheet '{sheet_in}' has no 'myelination_percentage'; skipping XY.")
                 continue
+
+            before = len(df_sheet)
             xy_df = df_sheet[existing].dropna(subset=["myelination_percentage"])
+            dropped = before - len(xy_df)
+            if dropped:
+                print(f"[INFO] XY '{sheet_in}': dropped {dropped} rows without myelination_percentage")
+
             xy_df = xy_df.sort_values(by="myelination_percentage")
+
             xy_name = f"XY {cond} {cell}"
             if xy_name in wb.sheetnames:
                 del wb[xy_name]
@@ -212,7 +247,7 @@ def build_feature_fraction_long(xlsx: pathlib.Path) -> pd.DataFrame:
     """
     Build a tidy (long) table with fractions per donor:
       columns: cond_donor, condition, cell_type, feature, has_pct, none_pct
-      has_pct = 100 * mean(count > 0) within (cond_donor, condition, cell_type)
+      has_pct = 100 * mean(count > 0) computed over rows where the count column is present (non-NA).
     """
     rows = []
     for cell in CELL_TYPES:
@@ -220,7 +255,8 @@ def build_feature_fraction_long(xlsx: pathlib.Path) -> pd.DataFrame:
             sheet = f"{cond} {cell}"
             try:
                 df = pd.read_excel(xlsx, sheet_name=sheet)
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Missing/unreadable sheet '{sheet}': {e}")
                 continue
             if df is None or len(df) == 0:
                 continue
@@ -231,20 +267,28 @@ def build_feature_fraction_long(xlsx: pathlib.Path) -> pd.DataFrame:
                 df["file_name"] = "unknown"
             for count_col, _ in FEATURES:
                 if count_col not in df.columns:
-                    df[count_col] = 0
+                    # Treat as missing, not zero ⇒ avoid biasing "none"
+                    df[count_col] = pd.NA
 
             df["cond_donor"] = df["file_name"].map(_cond_donor_stub)
+
             for donor, g in df.groupby("cond_donor", dropna=False):
-                n = len(g)
                 for count_col, feat_label in FEATURES:
-                    has_pct = 100.0 * (g[count_col].fillna(0) > 0).mean() if n > 0 else 0.0
+                    col = g[count_col]
+                    mask = col.notna()
+                    if mask.any():
+                        has_pct = 100.0 * (col[mask] > 0).mean()
+                        none_pct = 100.0 - has_pct
+                    else:
+                        has_pct = pd.NA
+                        none_pct = pd.NA
                     rows.append({
                         "cond_donor": donor,
                         "condition": cond,
                         "cell_type": cell,
                         "feature": feat_label,
                         "has_pct": has_pct,
-                        "none_pct": 100.0 - has_pct
+                        "none_pct": none_pct
                     })
     return pd.DataFrame(rows)
 

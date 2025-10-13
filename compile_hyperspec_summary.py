@@ -45,6 +45,18 @@ except Exception:
 
 DEFAULT_CONDITION = "Unknown"
 
+# --- Optional convenience for running in Spyder without typing args ---
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 1:  # no CLI args
+        # EDIT THESE TWO LINES:
+        sys.argv += [
+            "--data-root", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025",
+            "--out", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\Summary",
+            "--make-plots",           # uncomment if you want plots
+            # "--dry-run",              # uncomment to preview files
+        ]
+
 
 def infer_condition_from_path(path_like: str | Path) -> str:
     s = str(path_like)
