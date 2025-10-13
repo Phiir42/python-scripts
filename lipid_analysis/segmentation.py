@@ -107,6 +107,10 @@ def find_foci(
     remove_saturated,
     saturation_threshold,
     saturated_min_size,
+    # ---- new optional arguments ----
+    separate_objects=True,     # default: watershed splitting enabled (current behavior)
+    morph_op="opening",        # default: opening (current behavior)
+    morph_radius=3,            # default: radius 3 (current behavior)
     debug=False,
 ):
     """(Unchanged docstring from original—local maxima + watershed; re-include saturated regions.)"""
@@ -140,17 +144,28 @@ def find_foci(
         threshold_val = float("inf")
 
     mask_std = smoothed > threshold_val
-    opened = opening(mask_std, disk(3))
-    distance = ndi.distance_transform_edt(opened)
-    local_maxi_coords = feature.peak_local_max(
-        smoothed, min_distance=min_distance, labels=opened
-    )
-    local_maxi = np.zeros_like(opened, dtype=bool)
-    if local_maxi_coords.size:
-        local_maxi[tuple(local_maxi_coords.T)] = True
+    # Morphological regularization (opening for blobs, closing for filaments)
+    work = mask_std.copy()
+    if morph_op == "opening" and morph_radius > 0:
+        work = opening(work, disk(morph_radius))
+    elif morph_op == "closing" and morph_radius > 0:
+        work = closing(work, disk(morph_radius))
+    # else: "none" -> leave as-is
 
-    markers = ndi.label(local_maxi)[0]
-    labels_ws = segmentation.watershed(-distance, markers, mask=opened)
+    if separate_objects:
+        # Blob mode: split touching objects with watershed
+        distance = ndi.distance_transform_edt(work)
+        local_maxi_coords = feature.peak_local_max(
+            smoothed, min_distance=min_distance, labels=work
+        )
+        local_maxi = np.zeros_like(work, dtype=bool)
+        if local_maxi_coords.size:
+            local_maxi[tuple(local_maxi_coords.T)] = True
+        markers = ndi.label(local_maxi)[0]
+        labels_ws = segmentation.watershed(-distance, markers, mask=work)
+    else:
+        # Filament mode: just connected components (avoid over-segmentation)
+        labels_ws = measure.label(work)
 
     final_mask = np.zeros_like(labels_ws, dtype=bool)
     for region in measure.regionprops(labels_ws):
@@ -161,6 +176,9 @@ def find_foci(
     final_mask[exclude_mask] = True
 
     if debug:
-        print(f"[DEBUG] threshold_val={threshold_val:.2f}")
+        print(
+            f"[DEBUG] threshold_val={threshold_val:.2f} | "
+            f"morph_op={morph_op} r={morph_radius} | separate_objects={separate_objects}"
+        )
 
     return final_mask

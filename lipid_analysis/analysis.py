@@ -312,18 +312,23 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             plt.show()
             plt.close(fig)
 
-            # Optional: myelin
             try:
-                from . import myelin_analysis
-
-                myelin_mask, myelin_pct = myelin_analysis.detect_myelin(
+                # Reuse the robust MAD gate in find_foci, but avoid watershed splitting
+                myelin_mask = find_foci(
                     corrected_cars_slice,
-                    gaussian_sigma=1.0,
-                    offset=0.9,
-                    min_size=300,
-                    closing_radius=1,
+                    sigma=1.0,                  # light smoothing
+                    min_distance=8,             # unused when separate_objects=False
+                    min_size=300,               # drop speckles
+                    std_dev_multiplier=0.6,     # permissive for faint myelin
+                    remove_saturated=True,
+                    saturation_threshold=foci_params["saturation_threshold"],
+                    saturated_min_size=foci_params["saturated_min_size"],
+                    separate_objects=False,     # <<< key: no watershed
+                    morph_op="closing",         # <<< bridge/keep filaments
+                    morph_radius=2,
                     debug=VERBOSE,
                 )
+                myelin_pct = myelin_mask.sum() / myelin_mask.size
             except Exception:
                 myelin_pct = 0.0
 
