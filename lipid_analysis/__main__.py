@@ -1,5 +1,5 @@
 # lipid_analysis/__main__.py
-"""Module entry point: `python -m lipid_analysis`."""
+"""Module entry point for `python -m lipid_analysis`."""
 
 from .cli import main
 

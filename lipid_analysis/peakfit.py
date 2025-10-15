@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""
+Peak-fitting utilities for CARS CH-band spectra.
+
+Features
+--------
+- Complex-sum resonances (7 narrow + optional broad 3010 component).
+- Complex non-resonant background (constant + optional linear slope).
+- Optional far off-resonant pseudo terms.
+- Strictly linear, positive baseline parameterized at spectrum ends.
+- Multi-start (with jitter) and a short polish pass for robust convergence.
+- Batch χ² accumulation utilities and optional plot capture to PDF/PNG/PPTX.
+"""
+
+import logging
 import math
 import os
 from typing import Any, Dict, List, MutableMapping, Optional, Tuple
@@ -10,16 +24,22 @@ from matplotlib.backends.backend_pdf import PdfPages
 from scipy.interpolate import make_interp_spline
 from scipy.signal import find_peaks
 
+from .constants import LOG_LEVEL
+
 try:
-    # Types for lmfit objects are not available; use Any in annotations.
+    # lmfit types aren’t available at type-check time; use Any in annotations.
     from lmfit import Minimizer, Parameters
 except ImportError as e:
     raise ImportError("Please `pip install lmfit` to enable peak fitting.") from e
 
 
-# ----------------------------
+logger = logging.getLogger(__name__)
+logger.setLevel(LOG_LEVEL)
+
+
+# ---------------------------------------------------------------------
 # Debug capture of plots (PNG + multipage PDF + optional PPTX)
-# ----------------------------
+# ---------------------------------------------------------------------
 _DEBUG_CAPTURE: Dict[str, Any] = {
     "save_dir": None,  # type: Optional[str]
     "pdf": None,  # type: Optional[PdfPages]
@@ -28,7 +48,7 @@ _DEBUG_CAPTURE: Dict[str, Any] = {
 
 
 def start_debug_capture(save_dir: str, pdf_name: str = "fits.pdf") -> None:
-    """Begin capturing debug plot outputs."""
+    """Begin capturing debug plot outputs into a PDF and saved PNGs."""
     os.makedirs(save_dir, exist_ok=True)
     pdf_path = os.path.join(save_dir, pdf_name)
     _DEBUG_CAPTURE["save_dir"] = save_dir
@@ -38,7 +58,7 @@ def start_debug_capture(save_dir: str, pdf_name: str = "fits.pdf") -> None:
 
 def finish_debug_capture(make_pptx: bool = True, pptx_name: str = "fits.pptx") -> None:
     """Finish capturing: close PDF and optionally build a PPTX from saved PNGs."""
-    # close PDF
+    # Close PDF
     if _DEBUG_CAPTURE["pdf"] is not None:
         try:
             _DEBUG_CAPTURE["pdf"].close()
@@ -46,7 +66,7 @@ def finish_debug_capture(make_pptx: bool = True, pptx_name: str = "fits.pptx") -
             pass
         _DEBUG_CAPTURE["pdf"] = None
 
-    # build PPTX if requested
+    # Build PPTX if requested and available
     if make_pptx and _DEBUG_CAPTURE["paths"]:
         try:
             from pptx import Presentation  # type: ignore[import-not-found]
@@ -60,16 +80,16 @@ def finish_debug_capture(make_pptx: bool = True, pptx_name: str = "fits.pptx") -
             out_pptx = os.path.join(_DEBUG_CAPTURE["save_dir"], pptx_name)
             prs.save(out_pptx)
         except ImportError:
-            # PPTX generation is optional; ignore if python-pptx isn't installed.
+            # PPTX generation is optional.
             pass
 
     _DEBUG_CAPTURE["save_dir"] = None
     _DEBUG_CAPTURE["paths"] = []
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Chi-square accumulator (for batch debug summaries)
-# ----------------------------
+# ---------------------------------------------------------------------
 _CHI2_SUM: float = 0.0
 _CHI2_COUNT: int = 0
 _CHI2_NONCONV: int = 0
@@ -77,7 +97,7 @@ _CHI2_ITEMS: List[Dict[str, Any]] = []  # optional detail records
 
 
 def chi2_reset() -> None:
-    """Reset the running χ² counters (sum, count, non-converged)."""
+    """Reset running χ² counters (sum, count, non-converged) and detailed items."""
     global _CHI2_SUM, _CHI2_COUNT, _CHI2_NONCONV, _CHI2_ITEMS
     _CHI2_SUM = 0.0
     _CHI2_COUNT = 0
@@ -106,7 +126,7 @@ def chi2_add(
     success : bool
         Optimizer success flag (True/False).
     strategy : str
-        Which strategy was used, e.g. 'data-seeded + x8'.
+        Which strategy was used (for logging/QA).
     """
     global _CHI2_SUM, _CHI2_COUNT, _CHI2_NONCONV, _CHI2_ITEMS
     try:
@@ -117,12 +137,10 @@ def chi2_add(
     if not math.isfinite(rc):
         rc = float("nan")
 
+    # Count the attempt; accumulate finite χ² into the sum
+    _CHI2_COUNT += 1
     if math.isfinite(rc):
         _CHI2_SUM += rc
-        _CHI2_COUNT += 1
-    else:
-        # still count the attempt, but record as NaN in the details
-        _CHI2_COUNT += 1
 
     if not success:
         _CHI2_NONCONV += 1
@@ -140,25 +158,32 @@ def chi2_add(
 
 def report_chi2_summary() -> Dict[str, Any]:
     """
-    Print a one-line and a detailed χ² summary. Returns a dict with the stats.
+    Log and return a dict with χ² summary stats (sum/mean/n/non-converged)
+    and details of the worst five (finite) χ² cases.
     """
     n = _CHI2_COUNT if _CHI2_COUNT > 0 else 1
     mean = _CHI2_SUM / (_CHI2_COUNT if _CHI2_COUNT else 1)
-    print(
-        f"[χ²] total={_CHI2_SUM:.6g}  mean={mean:.6g}  "
-        f"n={_CHI2_COUNT}  non-converged={_CHI2_NONCONV}"
+
+    logger.info(
+        "[χ²] total=%.6g  mean=%.6g  n=%d  non-converged=%d",
+        _CHI2_SUM,
+        mean,
+        _CHI2_COUNT,
+        _CHI2_NONCONV,
     )
-    # Optional: top 5 worst by χ² (finite only)
+
     finite = [d for d in _CHI2_ITEMS if math.isfinite(d["redchi"])]
     worst = sorted(finite, key=lambda d: float(d["redchi"]), reverse=True)[:5]
     if worst:
-        print("[χ²] worst 5:")
+        logger.info("[χ²] worst 5:")
         for d in worst:
-            print(
-                "      series="
-                f"{str(d['series']):20s}  lipid={int(d['lipid_id']):>4}  "
-                f"χ²={float(d['redchi']):.6g}  success={bool(d['success'])}  "
-                f"{str(d['strategy'])}"
+            logger.info(
+                "      series=%-20s  lipid=%4d  χ²=%.6g  success=%s  %s",
+                str(d["series"]),
+                int(d["lipid_id"]),
+                float(d["redchi"]),
+                bool(d["success"]),
+                str(d["strategy"]),
             )
     return {
         "sum": _CHI2_SUM,
@@ -169,16 +194,13 @@ def report_chi2_summary() -> Dict[str, Any]:
     }
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Core model
-# ----------------------------
-def _cars_model_complex(
-    x: npt.ArrayLike, par: MutableMapping[str, Any]
-) -> np.ndarray:
+# ---------------------------------------------------------------------
+def _cars_model_complex(x: npt.ArrayLike, par: MutableMapping[str, Any]) -> np.ndarray:
     """
-    Complex-sum CARS model with optional broad 3010 band and a positive
-    strictly linear supporting baseline.
-    Returns: |sum(...)|^2 + baseline(x)
+    Complex-sum CARS model with optional broad 3010 band and a positive,
+    strictly linear baseline. Returns |sum(...)|^2 + baseline(x).
     """
     x_arr = np.asarray(x, dtype=float)
 
@@ -188,14 +210,14 @@ def _cars_model_complex(
 
     cc = np.zeros_like(x_arr, dtype=np.complex128)
 
-    # 7 narrow bands + optional broad (x8 is mandatory in defaults)
+    # 7 narrow bands + optional broad (x8 is enabled in defaults)
     for k in range(1, 8 + int(_p("enable_x8", 0))):
         A = _p(f"A{k}")
         x0 = _p(f"x{k}")
         w = _p(f"w{k}")
         cc += A / ((x_arr - x0) + 1j * w)
 
-    # Complex non-resonant background (constant + optional linear slope, both complex)
+    # Complex non-resonant background (constant + optional linear slope)
     cc += _p("ANR_re", 0.0) + 1j * _p("ANR_im", 0.0)
     xref = _p("xref", 3000.0)
     if _p("enable_linear_nr", 0):
@@ -210,17 +232,15 @@ def _cars_model_complex(
 
     y = np.abs(cc) ** 2
 
-    # --- strictly linear baseline ---
+    # Strictly linear baseline anchored at spectrum left and at BL_xright
     x_arr_min = float(np.min(x_arr))
-    # NEW: anchor the line at (x_arr_min, BL_left) and (BL_xright, BL_right)
-    BL_left   = _p("BL_left",  0.0)
-    BL_right  = _p("BL_right", 0.0)
-    BL_xright = _p("BL_xright", float(np.max(x_arr)))  # default to end if not provided
+    BL_left = _p("BL_left", 0.0)
+    BL_right = _p("BL_right", 0.0)
+    BL_xright = _p("BL_xright", float(np.max(x_arr)))
     den = max(BL_xright - x_arr_min, 1e-9)
     slope = (BL_right - BL_left) / den
     baseline = BL_left + slope * (x_arr - x_arr_min)
-    y = y + baseline
-    return y
+    return y + baseline
 
 
 def _residual(
@@ -229,19 +249,18 @@ def _residual(
     y: npt.ArrayLike,
     w: Optional[npt.ArrayLike] = None,
 ) -> np.ndarray:
+    """Residual function for least-squares: model(x) - y, optionally weighted."""
     r = _cars_model_complex(x, par) - np.asarray(y, dtype=float)
     if w is None:
         return r
     return r * np.asarray(w, dtype=float)
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Parameter seeding
-# ----------------------------
+# ---------------------------------------------------------------------
 def _make_default_params_from_config(config: Dict[str, Any]) -> Parameters:
-    """
-    Seeds/bounds. If config has no 'peak_fit' key, robust defaults are used.
-    """
+    """Create lmfit Parameters with seeds/bounds driven by `config['peak_fit']`."""
     pf: Dict[str, Any] = config.get("peak_fit", {})
 
     centers_seed = pf.get(
@@ -276,22 +295,18 @@ def _make_default_params_from_config(config: Dict[str, Any]) -> Parameters:
             max=widths_high[i],
             vary=True,
         )
-    # ---- Robust pruning: freeze selected peaks without min==max ----
-    # e.g. config["peak_fit"]["drop_peaks"] = [5]   # to drop Peak 5
+
+    # Robust pruning: freeze selected peaks without collapsing bounds
     drop_set = set(int(k) for k in pf.get("drop_peaks", []))
     for i in range(7):
         idx = i + 1
         if idx in drop_set:
-            # Freeze x and w
             if f"x{idx}" in p:
                 p[f"x{idx}"].set(vary=False)
             if f"w{idx}" in p:
                 p[f"w{idx}"].set(vary=False)
-
-            # Freeze amplitude to a feasible value WITHOUT changing min/max
             if f"A{idx}" in p:
                 A_par = p[f"A{idx}"]
-                # Prefer 0 if it's within bounds, else pick a bound safely inside
                 A_fix = 0.0
                 if A_par.min is not None and A_fix < A_par.min:
                     A_fix = float(A_par.min) + 1e-12
@@ -315,7 +330,7 @@ def _make_default_params_from_config(config: Dict[str, Any]) -> Parameters:
         vary=pf.get("ANR_im_vary", True),
     )
 
-    # Optional linear complex NR slope (ENABLED by default so wings can tilt)
+    # Optional linear complex NR slope (enabled by default so wings can tilt)
     p.add("enable_linear_nr", value=pf.get("enable_linear_nr_seed", 1), vary=False)
     p.add("xref", value=pf.get("xref", 3000.0), vary=False)
     p.add(
@@ -333,7 +348,7 @@ def _make_default_params_from_config(config: Dict[str, Any]) -> Parameters:
         vary=pf.get("BNR1_im_vary", True),
     )
 
-    # Far off-resonant pseudo-term: let it actually move
+    # Far off-resonant pseudo-term
     p.add(
         "xOR1",
         value=pf.get("xOR1_seed", 3549.0),
@@ -356,22 +371,20 @@ def _make_default_params_from_config(config: Dict[str, Any]) -> Parameters:
         vary=True,
     )
 
-    # Second pseudo-term still off by default
+    # Second pseudo-term disabled by default
     p.add("xOR2", value=pf.get("xOR2_seed", 0.0), min=0, max=1500, vary=False)
     p.add("AOR2", value=pf.get("AOR2_seed", 0.0), vary=False)
     p.add("wOR2", value=pf.get("wOR2_seed", 20.0), min=5, max=60, vary=False)
 
-    # Make the broad 3010 component mandatory and distinct from x4 (narrower)
+    # Broad 3010 component (mandatory and distinct from narrow peaks)
     p.add("enable_x8", value=1, vary=False)
     p.add("x8", value=pf.get("x8_seed", 3010.0), min=3000.0, max=3028.0, vary=True)
     p.add("A8", value=pf.get("A8_seed", 0.20), min=-3.0, max=3.0, vary=True)
     p.add("w8", value=pf.get("w8_seed", 50.0), min=30.0, max=100.0, vary=True)
 
-    # NEW: strictly positive *linear* baseline at [left, right]
-    # Midpoint removed; 0.3 default ensures modest uplift at edges.
-    p.add("BL_left",   value=pf.get("BL_left_seed",   0.3), min=-1.0, max=3.0, vary=False)
-    p.add("BL_right",  value=pf.get("BL_right_seed",  0.3), min=-1.0, max=3.0, vary=False)
-    # NEW: x-position (cm^-1) of the right baseline anchor; fixed (no fitting).
+    # Linear baseline anchors at left and right of the x-range
+    p.add("BL_left", value=pf.get("BL_left_seed", 0.3), min=-1.0, max=3.0, vary=False)
+    p.add("BL_right", value=pf.get("BL_right_seed", 0.3), min=-1.0, max=3.0, vary=False)
     p.add("BL_xright", value=pf.get("BL_xright_seed", 3000.0), vary=False)
 
     return p
@@ -382,8 +395,8 @@ def _seed_centers_from_data(
     y: npt.ArrayLike,
     target_centers: Tuple[int, ...] = (2855, 2890, 2935, 3019, 2812, 2909, 2968),
 ) -> List[float]:
-    # local smoothing for robust peak finding
-    from skimage.filters import gaussian  # local import; skimage is optional at runtime
+    """Estimate center seeds by finding nearby peaks to `target_centers`."""
+    from skimage.filters import gaussian  # optional dependency
 
     x_arr = np.asarray(x, dtype=float)
     y_arr = np.asarray(y, dtype=float)
@@ -398,9 +411,9 @@ def _seed_centers_from_data(
     return centers
 
 
-# ----------------------------
-# Baseline: supporting-line under the data
-# ----------------------------
+# ---------------------------------------------------------------------
+# Baseline: supporting line under the data
+# ---------------------------------------------------------------------
 def _supporting_line_under_curve(
     x: npt.ArrayLike,
     y_raw: npt.ArrayLike,
@@ -408,11 +421,9 @@ def _supporting_line_under_curve(
     smooth_sigma: float = 0.0,
 ) -> Tuple[float, float]:
     """
-    Return slope m and intercept c of the *highest* line y = m*x + c
-    that never exceeds the (optionally smoothed) raw spectrum:
-        m*x_i + c <= y_i  for all i
-    'tol_frac' gives a tiny slack (fraction of dynamic range) to avoid
-    rejecting nearly-tangent candidates due to noise.
+    Return slope m and intercept c of the highest line y = m*x + c
+    that never exceeds the (optionally smoothed) raw spectrum.
+    `tol_frac` is a small slack fraction of data range to tolerate noise.
     """
     x_arr = np.asarray(x, dtype=float)
     y_arr = np.asarray(y_raw, dtype=float)
@@ -422,7 +433,7 @@ def _supporting_line_under_curve(
     if x_f.size < 2:
         return 0.0, float(np.nanmin(y_f) if y_f.size else 0.0)
 
-    # optional gentle smoothing to mitigate single-point noise
+    # Optional gentle smoothing
     if smooth_sigma > 0:
         try:
             from skimage.filters import gaussian  # optional
@@ -434,10 +445,9 @@ def _supporting_line_under_curve(
 
     ymin = float(np.nanmin(y_f))
     ymax = float(np.nanmax(y_f))
-    dyn  = float(max(ymax - ymin, 1.0))
-    tol  = tol_frac * dyn
+    dyn = float(max(ymax - ymin, 1.0))
+    tol = tol_frac * dyn
 
-    # Brute-force over all pairs; keep the feasible line with the largest sum
     best_score = -np.inf
     best_m, best_c = 0.0, ymin
 
@@ -451,11 +461,11 @@ def _supporting_line_under_curve(
             m = (yj - yi) / (xj - xi)
             c = yi - m * xi
 
-            # Feasibility: line never above spectrum (allow tiny slack tol)
+            # Feasible if the line never exceeds the spectrum (within tol)
             if np.any(m * x_f + c > (y_check + tol)):
                 continue
 
-            # Score: choose the "highest" feasible line (largest total baseline)
+            # Score by total baseline height
             score = float(np.sum(m * x_f + c))
             if score > best_score:
                 best_score = score
@@ -464,11 +474,11 @@ def _supporting_line_under_curve(
     return best_m, best_c
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Fitting utilities
-# ----------------------------
+# ---------------------------------------------------------------------
 def _weights_for_fit(x: npt.ArrayLike, pf: Dict[str, Any]) -> np.ndarray:
-    # gentle weighting: boost endpoints and the 2880/2930 shoulders
+    """Construct gentle spectral weights emphasizing shoulders and edges."""
     x_arr = np.asarray(x, dtype=float)
     w = np.ones_like(x_arr, dtype=float)
 
@@ -495,19 +505,14 @@ def _run_once(
     w: Optional[npt.ArrayLike] = None,
     loss: str = "soft_l1",
 ) -> Any:
+    """Single least-squares run with configured loss and caps."""
     minner = Minimizer(_residual, params, fcn_args=(x, y, w))
-    # Disable covariance calculation to avoid RuntimeWarnings when the Hessian
-    # is ill-conditioned or when using robust loss (soft_l1/huber).
-    return minner.least_squares(
-        method="trf",
-        max_nfev=10000,
-        loss=loss,
-        f_scale=0.1,
-    )
+    # Disable covariance calculation to avoid warnings under robust losses.
+    return minner.least_squares(method="trf", max_nfev=10000, loss=loss, f_scale=0.1)
 
 
 def _jitter_params(p: Parameters, frac: float = 0.05) -> Parameters:
-    """Return a shallow-copied lmfit.Parameters with values jittered within bounds."""
+    """Return a shallow-copied Parameters with values jittered within bounds."""
     q = p.copy()
     rng = np.random.default_rng()
     for _name, par in q.items():
@@ -532,68 +537,57 @@ def _fit_with_retries(
     w: Optional[npt.ArrayLike],
     retries: int = 4,
 ) -> Tuple[Any, Parameters]:
-    """Try base + several jittered restarts; return best result & params."""
+    """Try a base run plus several jittered restarts; return best result & params."""
     best: Optional[Any] = None
     best_params: Parameters = base_params
 
-    # try two loss types for stubborn cases
+    # Try two loss types for stubborn cases
     for loss in ("soft_l1", "huber"):
-        # base try
+        # Base try
         res = _run_once(base_params, x, y, w, loss=loss)
-        cand = (
-            float(res.redchi)
-            if np.isfinite(getattr(res, "redchi", np.inf))
-            else float("inf")
-        )
+        cand = float(res.redchi) if np.isfinite(getattr(res, "redchi", np.inf)) else float("inf")
         best = res
         best_params = base_params
 
-        # jittered restarts
+        # Jittered restarts
         for _ in range(retries):
             pj = _jitter_params(base_params, frac=0.08)
             rj = _run_once(pj, x, y, w, loss=loss)
-            rc = (
-                float(rj.redchi)
-                if np.isfinite(getattr(rj, "redchi", np.inf))
-                else float("inf")
-            )
+            rc = float(rj.redchi) if np.isfinite(getattr(rj, "redchi", np.inf)) else float("inf")
             if rc < cand:
                 cand, best, best_params = rc, rj, pj
 
-    # --- POLISH STEP: one final pass with 'linear' loss from the best params ---
-    # This tightens the solution and often returns a "converged" termination.
-    from lmfit import Minimizer  # local import to keep top clean
-    pol_min = Minimizer(_residual, best.params, fcn_args=(x, y, w))
-    pol = pol_min.least_squares(
-        method="trf",
-        loss="linear",     # pure least squares (no robust weighting)
-        f_scale=1.0,
-        max_nfev=1500,     # short polish; adjust if you like
-    )
+    # Polish step: a short pass with linear loss from the best params
+    pol_min = Minimizer(_residual, best.params, fcn_args=(x, y, w))  # type: ignore[arg-type]
+    pol = pol_min.least_squares(method="trf", loss="linear", f_scale=1.0, max_nfev=1500)
     pol_redchi = float(getattr(pol, "redchi", np.inf))
     best_redchi = float(getattr(best, "redchi", np.inf))
     if np.isfinite(pol_redchi) and (pol_redchi <= best_redchi):
         best = pol
         best_params = pol.params
 
-    # best is always set (at least base try)
     assert best is not None
     return best, best_params
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Public API
-# ----------------------------
+# ---------------------------------------------------------------------
 def fit_cars_peaks(
     wavenumbers_cm1: npt.ArrayLike, intensity: npt.ArrayLike, config: Dict[str, Any]
 ) -> Dict[str, Any]:
     """
-    Fit CH-band CARS spectrum with:
-      - 7 narrow resonances + mandatory broad 3010 component (x8)
-      - complex NR (constant + optional linear slope)
-      - far off-resonant pseudo term(s)
-      - positive piecewise-linear baseline (BL_left / BL_right at edges/xref)
-      - multi-start with jitter for robust convergence
+    Fit a CARS CH-band spectrum.
+
+    Model components:
+    - 7 narrow resonances + mandatory broad 3010 component (x8).
+    - Complex NR background (constant + optional linear slope).
+    - Optional far off-resonant pseudo terms.
+    - Linear baseline anchored at left/right ends of the x-range.
+
+    The fitter operates on normalized data, with multi-start/jitter and a
+    short polish pass for robustness. Returns a dict with peak params, fit
+    quality metrics, a normalized model curve, and the normalization scale.
     """
     x = np.asarray(wavenumbers_cm1, dtype=float)
     y_raw = np.asarray(intensity, dtype=float)
@@ -601,48 +595,47 @@ def fit_cars_peaks(
     if not np.any(finite):
         raise ValueError("No finite intensity values in spectrum.")
 
-    # per-spectrum offset and dynamic range from FINITE samples only
+    # Per-spectrum offset and dynamic range from finite samples only
     ymin = float(np.nanmin(y_raw[finite]))
     ymax = float(np.nanmax(y_raw[finite]) - ymin)
     if not np.isfinite(ymax) or ymax <= 0:
         ymax = 1.0
 
-    # --- Seed baseline as the *supporting line* under the raw spectrum ---
+    # Seed baseline as a supporting line under the raw spectrum
     pf = config.get("peak_fit", {})
     m_sup, c_sup = _supporting_line_under_curve(
-        x, y_raw,
+        x,
+        y_raw,
         tol_frac=float(pf.get("baseline_tol_frac", 0.005)),
         smooth_sigma=float(pf.get("baseline_smooth_sigma", 0.0)),
     )
-    
-    # Values at the measurement endpoints
+
     x_min = float(np.min(x))
     x_max = float(np.max(x))
-    bl_left_raw  = m_sup * x_min + c_sup
+    bl_left_raw = m_sup * x_min + c_sup
     bl_right_raw = m_sup * x_max + c_sup
-    
-    # Normalize into the [0,1]-like working scale the fitter uses
-    bl_left_seed  = (bl_left_raw  - ymin) / ymax
+
+    # Normalize baseline seeds into working scale
+    bl_left_seed = (bl_left_raw - ymin) / ymax
     bl_right_seed = (bl_right_raw - ymin) / ymax
 
-    # normalized working array for fitting (leave NaNs out of the way)
+    # Normalized working array for fitting; interpolate non-finite if needed
     y = (y_raw - ymin) / ymax
-    # replace remaining non-finite with local linear interpolation; if that fails, set to 0
     if np.any(~finite):
         try:
             y[~finite] = np.interp(x[~finite], x[finite], y[finite])
         except Exception:
             y[~finite] = 0.0
-            
+
     weights = _weights_for_fit(x, pf.get("weights", {}))
 
     # Use a copy of config so we don't mutate the caller's dict
     cfg_for_fit = dict(config)
     cfg_for_fit_pf = dict(cfg_for_fit.get("peak_fit", {}))
     cfg_for_fit_pf.setdefault("drop_peaks", [5])
-    cfg_for_fit_pf["BL_left_seed"]   = float(bl_left_seed)
-    cfg_for_fit_pf["BL_right_seed"]  = float(bl_right_seed)
-    cfg_for_fit_pf["BL_xright_seed"] = float(x_max)   # line spans the full domain
+    cfg_for_fit_pf["BL_left_seed"] = float(bl_left_seed)
+    cfg_for_fit_pf["BL_right_seed"] = float(bl_right_seed)
+    cfg_for_fit_pf["BL_xright_seed"] = float(x_max)
     cfg_for_fit["peak_fit"] = cfg_for_fit_pf
 
     def _pack_output(res: Any, params: Parameters, label: str) -> Dict[str, Any]:
@@ -650,7 +643,6 @@ def fit_cars_peaks(
         out.update({f"A{k}": params[f"A{k}"].value for k in range(1, 8)})
         out.update({f"w{k}": params[f"w{k}"].value for k in range(1, 8)})
 
-        # extras
         for nm in (
             "ANR_re",
             "ANR_im",
@@ -673,15 +665,14 @@ def fit_cars_peaks(
             if nm in params:
                 out[nm] = params[nm].value
 
-        # diag
         msg = str(getattr(res, "message", "")).lower()
         redchi_val = float(getattr(res, "redchi", float("nan")))
         raw_success = bool(getattr(res, "success", False))
         heuristic_ok = (
-            (math.isfinite(redchi_val) and redchi_val < 2e-2)  # very good χ²
-            or ("gtol" in msg or "xtol" in msg or "ftol" in msg)  # typical terminations
+            (math.isfinite(redchi_val) and redchi_val < 2e-2)
+            or ("gtol" in msg or "xtol" in msg or "ftol" in msg)
         )
-    
+
         out.update(
             {
                 "success": raw_success or heuristic_ok,
@@ -721,16 +712,14 @@ def fit_cars_peaks(
     outB = _pack_output(resB, resB.params, "data-seeded+restarts")
 
     # Choose better of A/B
-    if outB["success"] and (
-        not np.isfinite(outA["redchi"]) or outB["redchi"] <= outA["redchi"]
-    ):
+    if outB["success"] and (not np.isfinite(outA["redchi"]) or outB["redchi"] <= outA["redchi"]):
         return outB
     return outA
 
 
-# ----------------------------
+# ---------------------------------------------------------------------
 # Debug plot
-# ----------------------------
+# ---------------------------------------------------------------------
 def _plot_peak_fit_debug(
     x_cm1: npt.ArrayLike,
     y_vals: npt.ArrayLike,
@@ -740,11 +729,7 @@ def _plot_peak_fit_debug(
     location: str,
     marker: str,
 ) -> None:
-    """
-    Plot raw hyperspectrum, individual components, and the total fit.
-    The red 'Total fit' includes resonances, complex NR (and its linear slope
-    if enabled), far off-resonant pseudo terms, and the additive baseline BL0/BL1.
-    """
+    """Plot raw spectrum, total fit, baseline, and individual peak components."""
     import matplotlib.pyplot as plt  # local to avoid import if not plotting
 
     x_arr = np.asarray(x_cm1, dtype=float)
@@ -762,7 +747,7 @@ def _plot_peak_fit_debug(
     plt.plot(x_dense, y_smooth, "-", color="black", lw=1.5, label="Raw (spline)")
     plt.scatter(x_arr, y_arr, c="k", s=25, marker="o", label="Raw points")
 
-    # Total fit (prefer precomputed y_fit which already includes baseline terms)
+    # Total fit (prefer precomputed y_fit which already includes baseline)
     y_fit_norm = fit_result.get("y_fit", None)
     if y_fit_norm is not None:
         y_fit_norm_arr = np.asarray(y_fit_norm, dtype=float)
@@ -770,12 +755,11 @@ def _plot_peak_fit_debug(
             y_fit_dense = make_interp_spline(x_arr, y_fit_norm_arr, k=3)(x_dense)
         except Exception:
             y_fit_dense = np.interp(x_dense, x_arr, y_fit_norm_arr)
-        # convert back to raw units
         plt.plot(x_dense, y_fit_dense * scale + offset, "r-", lw=2, label="Total fit")
 
-        # linear baseline only
-        BL_left   = float(fit_result.get("BL_left", 0.0))
-        BL_right  = float(fit_result.get("BL_right", 0.0))
+        # Linear baseline only (in raw units)
+        BL_left = float(fit_result.get("BL_left", 0.0))
+        BL_right = float(fit_result.get("BL_right", 0.0))
         BL_xright = float(fit_result.get("BL_xright", float(np.max(x_arr))))
         x_min = float(np.min(x_arr))
         den = max(BL_xright - x_min, 1e-9)
@@ -812,17 +796,14 @@ def _plot_peak_fit_debug(
             comp * scale,
             "--",
             lw=1.2,
-            color=colors[(idx) % len(colors)],
+            color=colors[idx % len(colors)],
             label=f"Peak {k} ({x0:.0f} cm⁻¹)",
         )
 
     ttl = f"LipidID {droplet_id} | {category}, {location}, {marker}"
     if "strategy_used" in fit_result:
         try:
-            ttl += (
-                f"  [{fit_result['strategy_used']}, "
-                f"χ²≈{float(fit_result.get('redchi', np.nan)):.3g}]"
-            )
+            ttl += f"  [{fit_result['strategy_used']}, χ²≈{float(fit_result.get('redchi', np.nan)):.3g}]"
         except Exception:
             ttl += f"  [{fit_result['strategy_used']}]"
     if fit_result.get("success", True) is False:
@@ -833,24 +814,18 @@ def _plot_peak_fit_debug(
     plt.legend(fontsize=8, ncol=2)
     plt.tight_layout()
 
-    # --- SAVE into capture if enabled (save BEFORE show/close) ---
+    # Save into capture if enabled (save before show/close)
     fig = plt.gcf()
     try:
         if _DEBUG_CAPTURE["pdf"] is not None:
             _DEBUG_CAPTURE["pdf"].savefig(fig, bbox_inches="tight")
         if _DEBUG_CAPTURE["save_dir"] is not None:
-            # use lipid id in filename when available
-            stem = (
-                f"fit_{int(droplet_id):04d}"
-                if str(droplet_id).isdigit()
-                else f"fit_{droplet_id}"
-            )
+            stem = f"fit_{int(droplet_id):04d}" if str(droplet_id).isdigit() else f"fit_{droplet_id}"
             png_path = os.path.join(_DEBUG_CAPTURE["save_dir"], f"{stem}.png")
             fig.savefig(png_path, dpi=200, bbox_inches="tight")
             _DEBUG_CAPTURE["paths"].append(png_path)
     except Exception:
         pass
 
-    # Now optionally display, then close.
     plt.show()
     plt.close(fig)

@@ -1,3 +1,4 @@
+# lipid_analysis/hyperspec_features.py
 """
 hyperspec_features.py
 =====================
@@ -8,7 +9,8 @@ Input format (long table)
 -------------------------
 One row per (droplet, fitted-peak). Columns observed:
 - 'Lipid ID', 'Category', 'Location', 'Cell Marker', 'LAMP2_Coloc',
-- 'Peak' (1..7), 'Center_cm^-1', 'Amplitude', 'FitSuccess'
+- 'Peak' (1..7), 'Center_cm^-1', 'Amplitude', 'FitSuccess', and optionally a width
+  column ('Width_cm^-1' or 'Width').
 
 Goal
 ----
@@ -16,17 +18,15 @@ Return **one row per droplet** with CH-stretch amplitude features:
 A2850, A2885, A2935, A2960, A3010, plus derived ratios:
 R_pack = A2885/A2850, U = A3010/A2850, R_me = A2935/(A2850+A2885),
 R_hi = (A2935+A2960)/(A2850+A2885).
+We also compute intensity-like proxies I_k = (A_k^2 / W_k^2) when widths exist,
+and intensity-based ratios including Rbg_I = I2850 / (I2885 + I2935 + I2960).
 
-How peaks are mapped
---------------------
-We do *not* trust the 'Peak' index to be a semantic label. Instead we map by
-nearest fitted center (cm^-1) to canonical CH-stretch targets:
-  2850, 2885, 2935, 2960, 3010.
-A fitted peak is accepted for a canonical target if its |Δcenter| <= 25 cm^-1.
-If multiple fitted peaks tie, the nearest wins.
-
-If no suitable peak is found for a target in a droplet, that target amplitude
-is NaN for that droplet.
+Mapping fitted → canonical peaks
+--------------------------------
+We do *not* trust the 'Peak' index as a semantic label. Instead we map by the
+nearest fitted center (cm^-1) to canonical CH targets: 2850, 2885, 2935, 2960, 3010.
+A fitted peak is accepted for a target if |Δcenter| <= 25 cm^-1. If multiple fitted
+peaks tie, the nearest wins. Missing targets are left as NaN.
 
 This module intentionally avoids any fingerprint-region logic.
 """
@@ -50,19 +50,29 @@ CANONICAL = {
 MAX_CENTER_DELTA = 25.0  # cm^-1
 
 
+def _series_or_nan(df: pd.DataFrame, name: str) -> pd.Series:
+    """Return the column if present; otherwise a NaN series aligned to df.index."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series(np.nan, index=df.index, dtype=float)
+
+
 def _pivot_peak_fits_long(df_long: pd.DataFrame) -> pd.DataFrame:
     """Convert the Peak Fits long table into one row per droplet with Axxxx and Wxxxx columns."""
-    # normalize column names (keep original case for outputs)
-    cols = {c: c for c in df_long.columns}
+    # Validate required columns
     required = ["Lipid ID", "Center_cm^-1", "Amplitude"]
     for r in required:
-        if r not in cols:
+        if r not in df_long.columns:
             raise ValueError(f"Peak Fits sheet missing required column: '{r}'")
 
-    # detect width column name
-    width_col = "Width_cm^-1" if "Width_cm^-1" in cols else ("Width" if "Width" in cols else None)
+    # Detect width column name (optional)
+    width_col = (
+        "Width_cm^-1"
+        if "Width_cm^-1" in df_long.columns
+        else ("Width" if "Width" in df_long.columns else None)
+    )
 
-    # enforce numeric
+    # Enforce numeric
     df = df_long.copy()
     df["Center_cm^-1"] = pd.to_numeric(df["Center_cm^-1"], errors="coerce")
     df["Amplitude"] = pd.to_numeric(df["Amplitude"], errors="coerce")
@@ -73,15 +83,16 @@ def _pivot_peak_fits_long(df_long: pd.DataFrame) -> pd.DataFrame:
     for droplet, grp in df.groupby("Lipid ID", sort=False):
         row: Dict[str, float] = {"DropletID": droplet}
         centers = grp["Center_cm^-1"].to_numpy(dtype=float)
-        amps    = grp["Amplitude"].to_numpy(dtype=float)
-        widths  = grp[width_col].to_numpy(dtype=float) if width_col is not None else None
+        amps = grp["Amplitude"].to_numpy(dtype=float)
+        widths = grp[width_col].to_numpy(dtype=float) if width_col is not None else None
 
         for key, target in CANONICAL.items():
-            # amplitude
+            # Handle empty/invalid groups
             if centers.size == 0 or np.all(~np.isfinite(centers)):
                 row[key] = np.nan
                 row["W" + key[1:]] = np.nan  # e.g., W2850
                 continue
+
             deltas = np.abs(centers - target)
             idx = int(np.nanargmin(deltas))
             if np.isfinite(deltas[idx]) and deltas[idx] <= MAX_CENTER_DELTA:
@@ -95,27 +106,33 @@ def _pivot_peak_fits_long(df_long: pd.DataFrame) -> pd.DataFrame:
                 row["W" + key[1:]] = np.nan
 
         out_rows.append(row)
+
     return pd.DataFrame(out_rows)
 
 
 def compute_features_table(df_peak_fits: pd.DataFrame) -> pd.DataFrame:
     """
-    Accepts the **Peak Fits** long-format DataFrame and returns a feature table.
+    Accept the **Peak Fits** long-format DataFrame and return a feature table.
     If the input already looks like a pivoted table with A2850/A2885/... columns,
     it is passed through after ensuring required columns exist.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per droplet with Axxxx, Wxxxx (if available), intensity proxies,
+        and ratio features.
     """
     cols = set(df_peak_fits.columns.astype(str))
     looks_long = {"Lipid ID", "Center_cm^-1", "Amplitude"}.issubset(cols)
     if looks_long:
         wide = _pivot_peak_fits_long(df_peak_fits)
     else:
-        # assume it's already pivoted like we want
+        # Assume it's already wide; ensure DropletID exists for consistency
         wide = df_peak_fits.copy()
-        # ensure DropletID column exists for joins
         if "DropletID" not in wide.columns and "Lipid ID" in wide.columns:
             wide = wide.rename(columns={"Lipid ID": "DropletID"})
 
-    # compute intensity proxies using widths: I_k = (A_k^2 / W_k^2)
+    # Compute intensity proxies using widths: I_k = (A_k^2 / W_k^2).
     out = wide.copy()
 
     def _safe_sq_over_sq(a, w):
@@ -125,15 +142,28 @@ def compute_features_table(df_peak_fits: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         return (a * a) / (w * w)
 
-    # Pull amplitudes and widths (may be NaN if not found)
-    A2850 = out.get("A2850"); W2850 = out.get("W2850")
-    A2885 = out.get("A2885"); W2885 = out.get("W2885")
-    A2935 = out.get("A2935"); W2935 = out.get("W2935")
-    # Prefer 2960; fall back to 2910 if that's what the export used
-    A2960 = out.get("A2960", out.get("A2910")); W2960 = out.get("W2960", out.get("W2910"))
-    A3010 = out.get("A3010"); W3010 = out.get("W3010")  # broad band (x8)
+    # Pull amplitudes and widths with robust fallbacks:
+    A2850 = _series_or_nan(out, "A2850")
+    W2850 = _series_or_nan(out, "W2850")
 
-    # Intensities
+    A2885 = _series_or_nan(out, "A2885")
+    W2885 = _series_or_nan(out, "W2885")
+
+    A2935 = _series_or_nan(out, "A2935")
+    W2935 = _series_or_nan(out, "W2935")
+
+    # Prefer 2960; fall back to 2910 if that’s what an older export used
+    A2960 = _series_or_nan(out, "A2960")
+    if A2960.isna().all():
+        A2960 = _series_or_nan(out, "A2910")
+    W2960 = _series_or_nan(out, "W2960")
+    if W2960.isna().all():
+        W2960 = _series_or_nan(out, "W2910")
+
+    A3010 = _series_or_nan(out, "A3010")
+    W3010 = _series_or_nan(out, "W3010")
+
+    # Intensities (elementwise)
     out["I2850"] = [_safe_sq_over_sq(a, w) for a, w in zip(A2850, W2850)]
     out["I2885"] = [_safe_sq_over_sq(a, w) for a, w in zip(A2885, W2885)]
     out["I2935"] = [_safe_sq_over_sq(a, w) for a, w in zip(A2935, W2935)]
@@ -147,17 +177,16 @@ def compute_features_table(df_peak_fits: pd.DataFrame) -> pd.DataFrame:
     I2960 = out["I2960"].astype(float)
     I3010 = out["I3010"].astype(float)
 
-    denom1I  = I2850.replace(0, np.nan)
+    denom1I = I2850.replace(0, np.nan)
     denom12I = (I2850 + I2885).replace(0, np.nan)
     denomBGI = (I2885 + I2935 + I2960).replace(0, np.nan)
 
-    # Swap all to intensity-based definitions
-    out["R_pack"] = (I2885 / denom1I).astype(float)  # packing/order
-    out["U"]      = (I3010 / denom1I).astype(float)  # unsaturation
-    out["R_hi"]   = ((I2935 + I2960) / denom12I).astype(float)
-    out["Rbg_I"]  = (I2850 / denomBGI).astype(float)  # myelin guard (Option B)
+    out["R_pack"] = (I2885 / denom1I).astype(float)           # packing/order
+    out["U"] = (I3010 / denom1I).astype(float)                 # unsaturation
+    out["R_hi"] = ((I2935 + I2960) / denom12I).astype(float)
+    out["Rbg_I"] = (I2850 / denomBGI).astype(float)            # myelin guard (Option B)
 
-    # optional fields that classifier expects; fill with NaN/False if absent
+    # Optional fields expected by the classifier; default if absent
     if "SNR_fit" not in out.columns:
         out["SNR_fit"] = np.nan
     out["det_3010"] = out["I3010"].fillna(0) > 0

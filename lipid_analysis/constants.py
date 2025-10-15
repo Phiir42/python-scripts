@@ -1,27 +1,32 @@
-# lipid_analysis/constants.py
-"""
-Global constants and default runtime flags.
+"""Constants and global configuration for the lipid analysis pipeline."""
 
-Notes:
-- VERBOSE and PEAKFIT_DEBUG are defaults; they may be overridden by CLI
-  or other runtime configuration. To avoid stale values, prefer:
-
-    import lipid_analysis.constants as const
-    if const.VERBOSE:
-        ...
-
-instead of `from lipid_analysis.constants import VERBOSE`.
-"""
+from __future__ import annotations
 
 import logging
+from typing import Final
 
 import numpy as np
 
-# Suppress excessive logs from nd2reader
+# -----------------------------------------------------------------------------
+# Runtime flags (these are defaults; your CLI or entry-point can override them)
+# -----------------------------------------------------------------------------
+VERBOSE: bool = True
+PEAKFIT_DEBUG: bool = True  # set True to display per-droplet fit plots
+
+# Derived log level aligned to VERBOSE (entry-point should still configure handlers)
+LOG_LEVEL: Final[int] = logging.INFO if VERBOSE else logging.WARNING
+
+# Suppress excessive logs from nd2reader regardless of VERBOSE
 logging.getLogger("nd2reader").setLevel(logging.ERROR)
 
-# Kernel for EAST-shadows filtering
-EAST_SHADOWS_KERNEL = np.array(
+# -----------------------------------------------------------------------------
+# Imaging / filtering constants
+# -----------------------------------------------------------------------------
+# Imaging channel constant (CARS channel index in ND2 files)
+CARS_CH: Final[int] = 2
+
+# 3×3 kernel for the "east-shadows" directional correlation filter
+EAST_SHADOWS_KERNEL: Final[np.ndarray] = np.array(
     [
         [-1, 0, 1],
         [-2, 1, 2],
@@ -29,10 +34,3 @@ EAST_SHADOWS_KERNEL = np.array(
     ],
     dtype=np.float32,
 )
-
-# Imaging channel constants
-CARS_CH = 2
-
-# Runtime flags (overridden by CLI)
-VERBOSE = True
-PEAKFIT_DEBUG = True  # set True to display per-droplet fit plots
