@@ -51,9 +51,9 @@ def main() -> None:
     args = [
         "run_debug.py",
         "--config",
-        r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD4d.py",
+        r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD4d.py",
         "--root",
-        r"C:\Users\clchr\OneDrive - Stanford",
+        r"D:\OneDrive - Stanford",
         "--verbose",
     ]
 

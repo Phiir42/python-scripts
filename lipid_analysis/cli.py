@@ -194,7 +194,6 @@ def main() -> None:
             logger.info("Processing hyperspectral series: %s", folder_name)
             process_hyperspectral_series(folder, reference_image, out_xlsx, hyperspec_params)
 
-            # NEW: compute myelin-minus-droplets average spectrum & fit it
             myelin_row = compute_myelin_average_for_series(
                 folder,
                 reference_image,
@@ -205,7 +204,6 @@ def main() -> None:
                 myelin_row["Folder"] = folder_name
                 myelin_rows.append(myelin_row)
 
-            # Close the peak-fit debug capture AFTER myelin
             try:
                 if constants.PEAKFIT_DEBUG:
                     finish_debug_capture(make_pptx=True)
@@ -223,7 +221,7 @@ def main() -> None:
             )
         logger.info("[myelin] Wrote per-series myelin average fits → %s", out_xlsx)
 
-    # 3b) Post-classification
+    # 4) Post-classification
     if not args.no_classify:
         from .postclassify import classify_hyperspectral_dir
 
@@ -237,7 +235,7 @@ def main() -> None:
         except Exception as exc:
             logger.warning("[WARN] Post-classification failed: %s", exc)
 
-    # 4) Excel outputs
+    # 5) Excel outputs
     save_results_to_excel(all_results, all_summary, output_file)
     logger.info("Results saved to %s", output_file)
 
