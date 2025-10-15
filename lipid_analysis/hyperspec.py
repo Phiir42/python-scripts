@@ -17,7 +17,6 @@ from .constants import CARS_CH, PEAKFIT_DEBUG, VERBOSE
 from .debug_utils import save_alignment_triptych
 from .filters import apply_east_shadows_filter
 from .segmentation import find_foci, process_fluorescence_channel
-from .myelin_analysis import detect_myelin
 from .peakfit import fit_cars_peaks, _plot_peak_fit_debug
 
 # This is intentionally set from the CLI before calling module functions.
@@ -527,16 +526,25 @@ def compute_myelin_average_for_series(
         debug=bool(VERBOSE),
     )
 
-    # 3b) Myelin mask from the same 9th frame using your myelin module.
-    my_mask, my_frac = detect_myelin(
+    # 3b) Myelin mask from the same 9th frame using the same permissive MAD gate
+    #     used in analysis.py (no watershed splitting; gentle closing).
+    #     Saturation thresholds pulled from foci_params (for consistency).
+    my_mask = find_foci(
         base9,
-        gaussian_sigma=float(myelin_params.get("gaussian_sigma", 1.0) or 1.0),
-        threshold_method=str(myelin_params.get("threshold_method", "otsu") or "otsu"),
-        offset=float(myelin_params.get("offset", 0.7) or 0.7),
-        min_size=int(myelin_params.get("min_size", 200) or 200),
-        closing_radius=int(myelin_params.get("closing_radius", 2) or 2),
-        debug=bool(myelin_params.get("debug", False)),
+        # analysis.py uses a light blur and permissive threshold for faint myelin
+        sigma=float(myelin_params.get("sigma", 1.0) or 1.0),
+        min_distance=int(myelin_params.get("min_distance", 8) or 8),   # unused when separate_objects=False
+        min_size=int(myelin_params.get("min_size", 300) or 300),
+        std_dev_multiplier=float(myelin_params.get("std_dev_multiplier", 0.6) or 0.6),
+        remove_saturated=True,
+        saturation_threshold=float(foci_params.get("saturation_threshold", 3500) or 3500),
+        saturated_min_size=int(foci_params.get("saturated_min_size", 50) or 50),
+        separate_objects=False,                        # <<< key: no watershed splitting
+        morph_op=str(myelin_params.get("morph_op", "closing") or "closing"),
+        morph_radius=int(myelin_params.get("morph_radius", 2) or 2),
+        debug=bool(VERBOSE),
     )
+    my_frac = float(np.count_nonzero(my_mask)) / float(my_mask.size)
 
     # 3c) Subtract out all other features.
     keep_mask = np.logical_and(my_mask, ~droplet_mask)
@@ -571,7 +579,7 @@ def compute_myelin_average_for_series(
     row = dict(fit)
     row.update({
         "Series": series,
-        "MyelinMaskFraction": float(np.count_nonzero(my_mask)) / float(my_mask.size),
+        "MyelinMaskFraction": my_frac,
         "PixelsUsed": int(np.count_nonzero(keep_mask)),
         "NormScale": float(scale),
     })

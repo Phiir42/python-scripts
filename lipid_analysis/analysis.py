@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from nd2reader import ND2Reader
 from skimage import measure
-from skimage.morphology import dilation, disk
 
 from .config_utils import resolve_marker_name
 from .constants import CARS_CH, VERBOSE
@@ -328,9 +327,8 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     morph_radius=2,
                     debug=VERBOSE,
                 )
-                myelin_pct = myelin_mask.sum() / myelin_mask.size
             except Exception:
-                myelin_pct = 0.0
+                myelin_mask = np.zeros_like(corrected_cars_slice, dtype=bool)
 
             # Lipid-ish foci from CARS
             cars_foci_mask = find_foci(corrected_cars_slice, **foci_params)
@@ -358,7 +356,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     config["morphology_params"]["autofluorescence_params"],
                 )
                 auto_mask = find_foci(
-                    auto_slice, **autofluorescence_params, debug=VERBOSE
+                    auto_slice, **autofluorescence_params
                 )
 
             # LAMP2 (optional)
@@ -376,8 +374,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         "lamp2_params",
                         config["morphology_params"]["autofluorescence_params"],
                     )
-                    lamp2_mask = find_foci(lamp2_mip, **lamp2_params, debug=VERBOSE)
-                    lamp2_mask = dilation(lamp2_mask, disk(1))
+                    lamp2_mask = find_foci(lamp2_mip, **lamp2_params)
                 except Exception:
                     lamp2_mask = None
 
@@ -385,6 +382,11 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             pure_lipid_mask = cars_foci_mask & ~auto_mask
             lipid_lipofuscin_mask = cars_foci_mask & auto_mask
             pure_lipofuscin_mask = auto_mask & ~cars_foci_mask
+
+            # NEW: subtract other-feature pixels (union of the three) from myelin before % calc
+            other_features_mask = pure_lipid_mask | lipid_lipofuscin_mask | pure_lipofuscin_mask
+            myelin_mask_refined = myelin_mask & (~other_features_mask)
+            myelin_pct = myelin_mask_refined.sum() / myelin_mask_refined.size if myelin_mask_refined.size else 0.0
 
             labeled_pure_lipid = measure.label(pure_lipid_mask)
             labeled_lipo_lipid = measure.label(lipid_lipofuscin_mask)
@@ -435,6 +437,7 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                         cars_image=corrected_cars_slice,
                         pos_index=pos,
                         title_suffix=f"[{cm_key}]",
+                        myelin_mask=myelin_mask_refined,
                     )
 
                 pos_results, pos_summary = analyze_3way_intracellular_objects(

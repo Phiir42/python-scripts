@@ -35,6 +35,7 @@ def debug_display_3way_segmentation(
     cars_image=None,
     pos_index=0,
     title_suffix="",
+    myelin_mask=None,
 ):
     """(Unchanged logic; slightly compacted layout.)"""
     from skimage.exposure import rescale_intensity
@@ -58,9 +59,15 @@ def debug_display_3way_segmentation(
     lipo_rgb = mask_rgb(lipid_lipofuscin_mask, (255, 0, 0))
     lipofuscin_rgb = mask_rgb(pure_lipofuscin_mask, (255, 0, 255))
     cell_rgb = mask_rgb(cell_mask, (0, 0, 255))
-    overlay = np.clip(
-        0.5 * pure_rgb + 0.5 * lipo_rgb + 0.5 * lipofuscin_rgb + 0.3 * cell_rgb, 0, 255
-    ).astype(np.uint8)
+
+    # NEW: myelin visualization (cyan).
+    myelin_rgb = mask_rgb(myelin_mask, (0, 255, 255)) if myelin_mask is not None else None
+
+    # NEW: include myelin in overlay if provided.
+    overlay_terms = [0.5 * pure_rgb, 0.5 * lipo_rgb, 0.5 * lipofuscin_rgb, 0.3 * cell_rgb]
+    if myelin_rgb is not None:
+        overlay_terms.append(0.5 * myelin_rgb)
+    overlay = np.clip(sum(overlay_terms), 0, 255).astype(np.uint8)
 
     fig, axs = plt.subplots(2, 4, figsize=(18, 9))
     if auto8 is not None:
@@ -85,8 +92,15 @@ def debug_display_3way_segmentation(
     axs[1, 1].set_title("Lipid+Lipofuscin")
     axs[1, 2].imshow(lipofuscin_rgb)
     axs[1, 2].set_title("Pure Lipofuscin")
-    axs[1, 3].axis("off")
-    axs[1, 3].set_title("")
+
+    # NEW: Final myelin mask (refined).
+    if myelin_rgb is not None:
+        axs[1, 3].imshow(myelin_rgb)
+        axs[1, 3].set_title("Myelin (final)")
+    else:
+        axs[1, 3].axis("off")
+        axs[1, 3].set_title("")
+
     for row in axs:
         for ax in row:
             ax.axis("off")
