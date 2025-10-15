@@ -535,7 +535,7 @@ def compute_myelin_average_for_series(
         sigma=float(myelin_params.get("sigma", 1.0) or 1.0),
         min_distance=int(myelin_params.get("min_distance", 8) or 8),   # unused when separate_objects=False
         min_size=int(myelin_params.get("min_size", 300) or 300),
-        std_dev_multiplier=float(myelin_params.get("std_dev_multiplier", 0.6) or 0.6),
+        std_dev_multiplier=float(myelin_params.get("std_dev_multiplier", 0.6) or 0.8),
         remove_saturated=True,
         saturation_threshold=float(foci_params.get("saturation_threshold", 3500) or 3500),
         saturated_min_size=int(foci_params.get("saturated_min_size", 50) or 50),

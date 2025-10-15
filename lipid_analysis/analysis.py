@@ -240,6 +240,103 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                 blurred_sl = gaussian(slice_div, sigma=blur_sigma, preserve_range=True)
                 z_stack_slices_cars.append(blurred_sl)
             return np.max(np.array(z_stack_slices_cars), axis=0)
+        
+        def _assess_low_feature(
+            img2d,
+            sigma,
+            remove_saturated,
+            sat_thresh,
+            sat_min,
+            rr_thresh=0.12,            # robust range cutoff
+            edge_q=1.5,                # gradient threshold = med + edge_q*MAD
+            edge_min_frac=0.16,        # ★ tuned for AD44-S1342
+            lap_var_thresh=4.8e-3,     # ★ tuned for AD44-S1342
+            snr_thresh=0.285,          # ★ enable SNR as 4th cue (set to None to disable)
+            debug=False,
+        ):
+            """
+            Return (is_low_feature: bool, metrics: dict).
+        
+            Cues after smoothing & saturation exclusion (mirrors find_foci preproc):
+              - robust_range = (p99 - p1) / median
+              - edge_density = fraction of Sobel magnitudes > med + edge_q*MAD
+              - lap_var      = var(laplace(img / median))
+              - snr          = approx_std / median  (approx_std from 1.4826 * MAD)
+        
+            Flag low-feature if at least 2 conditions fail their thresholds.
+            """
+            from skimage.filters import gaussian, sobel
+            import scipy.ndimage as ndi
+        
+            im = np.nan_to_num(img2d.astype(np.float32), copy=False)
+            if sigma > 0:
+                im = gaussian(im, sigma=sigma, preserve_range=True)
+        
+            # Exclude saturated (same rule as find_foci)
+            exclude = np.zeros_like(im, dtype=bool)
+            if remove_saturated:
+                labeled_sat = measure.label(im > sat_thresh)
+                for reg in measure.regionprops(labeled_sat):
+                    if reg.area >= sat_min:
+                        exclude[tuple(reg.coords.T)] = True
+        
+            vp = im[~exclude].ravel()
+            if vp.size == 0:
+                if debug:
+                    print("[LOWFEAT] empty valid region → low-feature")
+                return True, {"robust_range": 0.0, "edge_density": 0.0, "lap_var": 0.0, "snr": 0.0}
+        
+            med = float(np.median(vp))
+        
+            # Robust range
+            p1, p99 = np.percentile(vp, [1.0, 99.0])
+            robust_range = float((p99 - p1) / max(med, 1e-9))
+        
+            # Edge density (Sobel + robust threshold)
+            gmag = np.abs(sobel(im))
+            gv = gmag[~exclude].ravel()
+            gmed = float(np.median(gv))
+            gmad = float(np.median(np.abs(gv - gmed)))
+            gstd = 1.4826 * gmad
+            gthr = gmed + edge_q * gstd
+            edge_density = float(np.mean(gv > gthr)) if gv.size else 0.0
+        
+            # Laplacian variance (scale-normalized)
+            imn = im / max(med, 1e-9)
+            lap = ndi.laplace(imn)
+            lap_var = float(np.var(lap[~exclude])) if vp.size else 0.0
+        
+            # SNR (same definition you’ve been printing)
+            mad = float(np.median(np.abs(vp - med)))
+            approx_std = 1.4826 * mad
+            snr = approx_std / max(med, 1e-9)
+        
+            # Two-(of up to four)-fails rule
+            fails = 0
+            fails += int(robust_range < rr_thresh)
+            fails += int(edge_density < edge_min_frac)
+            fails += int(lap_var < lap_var_thresh)
+            if snr_thresh is not None:
+                fails += int(snr < snr_thresh)
+        
+            low_feature = (fails >= 2)
+        
+            if debug:
+                print(
+                    f"[LOWFEAT] rr={robust_range:.4f} (<{rr_thresh}) | "
+                    f"edgeden={edge_density:.4f} (<{edge_min_frac}) | "
+                    f"lapvar={lap_var:.4e} (<{lap_var_thresh}) | "
+                    f"snr={snr:.3f} (<{snr_thresh if snr_thresh is not None else '—'}) "
+                    f"→ low={low_feature}"
+                )
+        
+            return low_feature, {
+                "robust_range": robust_range,
+                "edge_density": edge_density,
+                "lap_var": lap_var,
+                "snr": snr,
+            }
+
 
         for pos in range(fluoro_nd2.sizes["v"]):
             fluoro_nd2.default_coords["v"] = pos
@@ -312,18 +409,43 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
             plt.close(fig)
 
             try:
-                # Reuse the robust MAD gate in find_foci, but avoid watershed splitting
+                # Assess low-feature status for this frame (myelin only)
+                low_feat, metrics = _assess_low_feature(
+                    corrected_cars_slice,
+                    sigma=1.0,
+                    remove_saturated=True,
+                    sat_thresh=foci_params["saturation_threshold"],
+                    sat_min=foci_params["saturated_min_size"],
+                    # Tuned defaults for AD44-S1342; tweak or move to config as needed:
+                    edge_min_frac=0.16,
+                    lap_var_thresh=4.8e-3,
+                    snr_thresh=0.285,   # set to None to disable SNR
+                    debug=VERBOSE,
+                )
+                
+                # Only nudge the std-dev multiplier; keep everything else identical
+                sdmul = 1.6 if low_feat else 0.8
+                if VERBOSE:
+                    print(
+                        f"[MYELIN] pos={pos+1} low_feature={low_feat} "
+                        f"(rr={metrics['robust_range']:.3f}, "
+                        f"ed={metrics['edge_density']:.3f}, "
+                        f"lv={metrics['lap_var']:.3e}, "
+                        f"snr={metrics['snr']:.3f}) -> sdmul={sdmul:.2f}"
+                    )
+
+                # Robust myelin: permissive gate + SNR-adaptive floor/zscore
                 myelin_mask = find_foci(
                     corrected_cars_slice,
-                    sigma=1.0,                  # light smoothing
-                    min_distance=8,             # unused when separate_objects=False
-                    min_size=300,               # drop speckles
-                    std_dev_multiplier=0.6,     # permissive for faint myelin
+                    sigma=1.0,
+                    min_distance=8,
+                    min_size=300,
+                    std_dev_multiplier=sdmul,
                     remove_saturated=True,
                     saturation_threshold=foci_params["saturation_threshold"],
                     saturated_min_size=foci_params["saturated_min_size"],
-                    separate_objects=False,     # <<< key: no watershed
-                    morph_op="closing",         # <<< bridge/keep filaments
+                    separate_objects=False,
+                    morph_op="closing",
                     morph_radius=2,
                     debug=VERBOSE,
                 )
@@ -427,18 +549,20 @@ def process_nd2_pair(fluorescence_path, cars_path, reference_image):
                     offset=offset_val,
                 )
 
-                if VERBOSE:
-                    debug_display_3way_segmentation(
-                        pure_lipid_mask,
-                        lipid_lipofuscin_mask,
-                        pure_lipofuscin_mask,
-                        cm_mask,
-                        auto_image=auto_slice,
-                        cars_image=corrected_cars_slice,
-                        pos_index=pos,
-                        title_suffix=f"[{cm_key}]",
-                        myelin_mask=myelin_mask_refined,
-                    )
+                debug_display_3way_segmentation(
+                    pure_lipid_mask,
+                    lipid_lipofuscin_mask,
+                    pure_lipofuscin_mask,
+                    cm_mask,
+                    auto_image=auto_slice,
+                    cars_image=corrected_cars_slice,
+                    pos_index=pos,
+                    title_suffix=f"[{cm_key}]",
+                    myelin_mask=myelin_mask_refined,
+                    base_data_dir=config["paths"]["data_directory"],
+                    file_identifier=os.path.splitext(os.path.basename(fluorescence_path))[0],
+                    show_plots=VERBOSE,   # only display if verbose
+                )
 
                 pos_results, pos_summary = analyze_3way_intracellular_objects(
                     labeled_pure_lipid,

@@ -107,10 +107,12 @@ def find_foci(
     remove_saturated,
     saturation_threshold,
     saturated_min_size,
-    # ---- new optional arguments ----
-    separate_objects=True,     # default: watershed splitting enabled (current behavior)
-    morph_op="opening",        # default: opening (current behavior)
-    morph_radius=3,            # default: radius 3 (current behavior)
+    # ---- optional arguments (existing) ----
+    separate_objects=True,
+    morph_op="opening",
+    morph_radius=3,
+    # ---- NEW optional robustness guards (all off by default) ----
+    min_snr=None,
     debug=False,
 ):
     """(Unchanged docstring from original—local maxima + watershed; re-include saturated regions.)"""
@@ -140,6 +142,19 @@ def find_foci(
         mad_val = float(robust_mad(valid_pixels))  # <- call local function directly
         approx_std = 1.4826 * mad_val
         threshold_val = median_val + (std_dev_multiplier * approx_std)
+        
+        if debug:
+            snr = approx_std / (max(median_val, 1e-9))
+            print(f"[DEBUG] Frame stats: median={median_val:.4f}, std≈{approx_std:.4f}, "
+                  f"SNR={snr:.4f}, threshold={threshold_val:.4f}")
+
+        # ---- NEW: early low-contrast guard (optional) ----
+        if min_snr is not None:
+            snr = approx_std / (max(median_val, 1e-9))
+            if snr < float(min_snr):
+                if debug:
+                    print(f"[DEBUG] Low-contrast frame: SNR={snr:.4f} < {min_snr}; returning empty mask")
+                return np.zeros_like(image_slice, dtype=bool)
     else:
         threshold_val = float("inf")
 
