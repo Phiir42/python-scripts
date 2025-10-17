@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Set
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -617,10 +617,91 @@ def process_nd2_pair(
                     logger.exception("LAMP2 detection failed; continuing without it.")
                     lamp2_mask = None
 
-            # 3-way masks
-            pure_lipid_mask = cars_foci_mask & ~auto_mask
-            lipid_lipofuscin_mask = cars_foci_mask & auto_mask
-            pure_lipofuscin_mask = auto_mask & ~cars_foci_mask
+            def _colocalize_objects(
+                cars_mask: np.ndarray,
+                af_mask: np.ndarray,
+                min_overlap: int,
+            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                """
+                Return labeled masks (pure_lipid, lipid+lipofuscin, pure_lipofuscin)
+                using object-level colocalization with voxel-overlap >= min_overlap.
+                """
+                # Label both masks
+                cars_labels = measure.label(cars_mask)
+                af_labels = measure.label(af_mask)
+            
+                # Prepare output label images
+                labeled_pure_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+                labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+                labeled_pure_lipo  = np.zeros_like(af_labels, dtype=np.int32)
+            
+                # Track AF labels already consumed by colocalization to prevent double counting
+                consumed_af: Set[int] = set()
+            
+                # Re-label counters for clean, consecutive IDs in outputs
+                next_pure_lipid_id = 1
+                next_lipo_lipid_id = 1
+                next_pure_lipo_id  = 1
+            
+                # For each CARS object, decide pure lipid vs lipid+lipofuscin by overlap
+                max_cid = int(cars_labels.max())
+                for cid in range(1, max_cid + 1):
+                    cid_mask = (cars_labels == cid)
+                    if not np.any(cid_mask):
+                        continue
+            
+                    # Which AF labels overlap this CARS object (and by how many voxels)?
+                    # We can do this efficiently by looking up af_labels only where cid_mask is True.
+                    af_touch = af_labels[cid_mask]
+                    if af_touch.size == 0:
+                        # No pixels → treat as pure lipid
+                        labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+                        next_pure_lipid_id += 1
+                        continue
+            
+                    # Count overlaps per AF id
+                    # bincount index 0 corresponds to background, we ignore it.
+                    counts = np.bincount(af_touch, minlength=int(af_labels.max()) + 1)
+                    counts[0] = 0  # ignore background
+                    # Find the AF object with the largest overlap
+                    best_af = int(np.argmax(counts))
+                    best_overlap = int(counts[best_af])
+            
+                    if best_af > 0 and best_overlap >= int(min_overlap):
+                        # Colocalized: label CARS object as lipid+lipofuscin
+                        labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
+                        next_lipo_lipid_id += 1
+                        # Consume that AF object so it won't be counted again as pure lipofuscin
+                        consumed_af.add(best_af)
+                    else:
+                        # Not enough overlap with any AF object → pure lipid
+                        labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+                        next_pure_lipid_id += 1
+            
+                # Any AF objects not consumed become pure lipofuscin
+                max_aid = int(af_labels.max())
+                for aid in range(1, max_aid + 1):
+                    if aid in consumed_af:
+                        continue
+                    aid_mask = (af_labels == aid)
+                    if not np.any(aid_mask):
+                        continue
+                    labeled_pure_lipo[aid_mask] = next_pure_lipo_id
+                    next_pure_lipo_id += 1
+            
+                return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
+            
+            min_overlap = int(foci_params.get("min_size", 20))
+            labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo = _colocalize_objects(
+                cars_foci_mask,
+                auto_mask if auto_slice is not None else np.zeros_like(cars_foci_mask, dtype=bool),
+                min_overlap=min_overlap,
+            )
+            
+            # Boolean masks for visualization and myelin exclusion
+            pure_lipid_mask = (labeled_pure_lipid > 0)
+            lipid_lipofuscin_mask = (labeled_lipo_lipid > 0)
+            pure_lipofuscin_mask = (labeled_pure_lipo > 0)
 
             # Exclude any other-feature pixels from myelin % calculation
             other_features_mask = (
@@ -632,10 +713,6 @@ def process_nd2_pair(
                 if myelin_mask_refined.size
                 else 0.0
             )
-
-            labeled_pure_lipid = measure.label(pure_lipid_mask)
-            labeled_lipo_lipid = measure.label(lipid_lipofuscin_mask)
-            labeled_pure_lipo = measure.label(pure_lipofuscin_mask)
 
             # Per-marker cell masks (alias-aware; no filename gating)
             for cm in chosen_cell_markers:  # type: ignore[assignment]

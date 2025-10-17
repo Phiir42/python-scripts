@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import cv2
 import matplotlib.pyplot as plt
@@ -76,6 +76,65 @@ def _normalize_row_max(y: np.ndarray, eps: float = 1e-9) -> tuple[np.ndarray, fl
     m = float(np.max(y_clean))
     m = m if m > eps else 1.0
     return y_clean / m, m
+
+
+def _colocalize_objects(
+    cars_mask: np.ndarray,
+    af_mask: np.ndarray,
+    min_overlap: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return labeled masks (pure_lipid, lipid+lipofuscin, pure_lipofuscin)
+    using object-level colocalization with voxel-overlap >= min_overlap.
+    """
+    cars_labels = measure.label(cars_mask)
+    af_labels   = measure.label(af_mask)
+
+    labeled_pure_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_pure_lipo  = np.zeros_like(af_labels,   dtype=np.int32)
+
+    consumed_af: Set[int] = set()
+    next_pure_lipid_id = 1
+    next_lipo_lipid_id = 1
+    next_pure_lipo_id  = 1
+
+    max_cid = int(cars_labels.max())
+    for cid in range(1, max_cid + 1):
+        cid_mask = (cars_labels == cid)
+        if not np.any(cid_mask):
+            continue
+
+        af_touch = af_labels[cid_mask]
+        if af_touch.size == 0:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+            continue
+
+        counts = np.bincount(af_touch, minlength=int(af_labels.max()) + 1)
+        counts[0] = 0
+        best_af = int(np.argmax(counts))
+        best_overlap = int(counts[best_af])
+
+        if best_af > 0 and best_overlap >= int(min_overlap):
+            labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
+            next_lipo_lipid_id += 1
+            consumed_af.add(best_af)
+        else:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+
+    max_aid = int(af_labels.max())
+    for aid in range(1, max_aid + 1):
+        if aid in consumed_af:
+            continue
+        aid_mask = (af_labels == aid)
+        if not np.any(aid_mask):
+            continue
+        labeled_pure_lipo[aid_mask] = next_pure_lipo_id
+        next_pure_lipo_id += 1
+
+    return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
 
 
 def _save_labeled_mask_images(
@@ -764,14 +823,28 @@ def process_hyperspectral_series(
     )
 
     # --- Droplet masks and overlays ---
-    lipid_mask = find_foci(mask_image, **foci_params)
-    pure_lipid_mask = lipid_mask & ~auto_mask
-    lipid_lipofuscin_mask = lipid_mask & auto_mask
-    pure_lipofuscin_mask = auto_mask & ~lipid_mask
-
-    intracellular_pure_lipid = pure_lipid_mask & cell_mask
-    intracellular_lipid_lipofuscin = lipid_lipofuscin_mask & cell_mask
-    intracellular_pure_lipofuscin = pure_lipofuscin_mask & cell_mask
+    cars_foci_mask = find_foci(mask_image, **foci_params)
+    
+    # Use the same rule as analysis.py: overlap threshold = min_size used to detect CARS foci
+    min_overlap = int(foci_params.get("min_size", 20))
+    
+    labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo = _colocalize_objects(
+        cars_foci_mask,
+        auto_mask if auto_mip is not None else np.zeros_like(cars_foci_mask, dtype=bool),
+        min_overlap=min_overlap,
+    )
+    
+    # Boolean views for visualization and downstream logic
+    pure_lipid_mask        = (labeled_pure_lipid > 0)
+    lipid_lipofuscin_mask  = (labeled_lipo_lipid > 0)
+    pure_lipofuscin_mask   = (labeled_pure_lipo > 0)
+    
+    # “Lipid” = any CARS-positive droplet (pure lipid or lipid+lipofuscin)
+    lipid_mask = pure_lipid_mask | lipid_lipofuscin_mask
+    
+    intracellular_pure_lipid        = pure_lipid_mask & cell_mask
+    intracellular_lipid_lipofuscin  = lipid_lipofuscin_mask & cell_mask
+    intracellular_pure_lipofuscin   = pure_lipofuscin_mask & cell_mask
 
     if VERBOSE:
         debug_display_3way_segmentation(

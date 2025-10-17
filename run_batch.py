@@ -63,7 +63,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(r"D:\OneDrive - Stanford"),
+        default=Path(r"C:\Users\clchr\OneDrive - Stanford"),
         help="Root path override passed to lipid_analysis (--root).",
     )
     parser.add_argument(
