@@ -8,6 +8,8 @@ from typing import Any, Dict, Mapping, Sequence
 import numpy as np
 from numpy.typing import NDArray
 from skimage.exposure import rescale_intensity
+from skimage.filters import gaussian
+from .filters import apply_east_shadows_filter
 
 from .constants import LOG_LEVEL
 
@@ -206,3 +208,45 @@ def composite_fluorescence(
 
     comp = np.clip(comp, 0.0, 1.0)
     return (comp * 255.0).astype(np.uint8)
+
+
+def get_corrected_cars_stack(
+    nd2obj,
+    c_index: int,
+    position: int,
+    ref_image: np.ndarray,
+    fparams: Mapping[str, object],
+) -> np.ndarray:
+    """Return corrected CARS stack with shape (Z, H, W)."""
+    total_z = nd2obj.sizes.get("z", 1)
+    blur_sigma = float(fparams.get("sigma", 0.0) or 0.0)
+    den = np.clip(ref_image.astype(np.float32, copy=False), 1e-6, None)
+
+    slices = []
+    for z_slice in range(total_z):
+        raw = np.nan_to_num(nd2obj.get_frame_2D(v=position, c=c_index, z=z_slice))
+        correlated = apply_east_shadows_filter(raw)
+        div = correlated / den
+        if blur_sigma > 0:
+            div = gaussian(div, sigma=blur_sigma, preserve_range=True)
+        slices.append(div.astype(np.float32, copy=False))
+    return np.stack(slices, axis=0)
+
+
+def get_fluorescence_stack(
+    nd2obj,
+    ch_index: int,
+    position: int,
+    fluoro_params: Mapping[str, object],
+) -> np.ndarray:
+    """Return processed fluorescence stack (Z, H, W) with optional per-slice Gaussian smoothing."""
+    total_z = nd2obj.sizes.get("z", 1)
+    gaussian_sigma = float(fluoro_params.get("gaussian_sigma", 0.0) or 0.0)
+
+    slices = []
+    for z_slice in range(total_z):
+        raw = np.nan_to_num(nd2obj.get_frame_2D(v=position, c=ch_index, z=z_slice))
+        if gaussian_sigma > 0:
+            raw = gaussian(raw, sigma=gaussian_sigma, preserve_range=True)
+        slices.append(raw.astype(np.float32, copy=False))
+    return np.stack(slices, axis=0)

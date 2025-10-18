@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 from scipy import ndimage as ndi
-from skimage import feature, measure, segmentation
+from skimage import feature, segmentation, measure
+from skimage.measure import label
 from skimage.filters import (
     gaussian,
     threshold_li,
     threshold_otsu,
     threshold_triangle,
     threshold_yen,
+    sobel
 )
 from skimage.morphology import closing, disk, opening, remove_small_objects
 
@@ -147,6 +149,52 @@ def process_fluorescence_channel(
         plt.show()
 
     return cell_mask
+
+
+def process_fluorescence_stack(
+    stack_3d: np.ndarray,
+    *,
+    cell_size: int,
+    min_size: int,
+    closing_radius: int,
+    gaussian_sigma: float,
+    fill_holes: bool,
+    threshold_method: str,
+    offset: float,
+    exclude_dark_regions: bool = True,
+    dark_threshold: float = 50,
+    min_hole_size: int = 20_000,
+    min_voxels_3d: Optional[int] = None,
+    debug: bool = False,
+) -> np.ndarray:
+    """
+    Build a 3-D cell mask by applying `process_fluorescence_channel` to each z-slice
+    of a (Z,H,W) fluorescence stack, then optional 3-D small-object removal.
+    """
+    if stack_3d.ndim != 3:
+        raise ValueError(f"Expected a (Z,H,W) stack, got shape {stack_3d.shape}")
+
+    masks = []
+    for z in range(stack_3d.shape[0]):
+        mz = process_fluorescence_channel(
+            stack_3d[z],
+            cell_size=cell_size,
+            min_size=min_size,
+            closing_radius=closing_radius,
+            gaussian_sigma=gaussian_sigma,
+            fill_holes=fill_holes,
+            threshold_method=threshold_method,
+            offset=offset,
+            exclude_dark_regions=exclude_dark_regions,
+            dark_threshold=dark_threshold,
+            min_hole_size=min_hole_size,
+            debug=(debug and z == 0),
+        )
+        masks.append(mz.astype(bool, copy=False))
+    m3d = np.stack(masks, axis=0)
+    if min_voxels_3d and min_voxels_3d > 1:
+        m3d = remove_small_objects(m3d, min_size=int(min_voxels_3d), connectivity=1)
+    return m3d
 
 
 def robust_mad(a: np.ndarray) -> float:
@@ -308,3 +356,153 @@ def find_foci(
         )
 
     return final_mask
+
+
+def assess_low_feature(
+    img2d: np.ndarray,
+    *,
+    sigma: float,
+    remove_saturated: bool,
+    sat_thresh: float,
+    sat_min: int,
+    rr_thresh: float = 0.12,
+    edge_q: float = 1.5,
+    edge_min_frac: float = 0.16,
+    lap_var_thresh: float = 4.8e-3,
+    snr_thresh: Optional[float] = 0.285,
+    debug: bool = False,
+) -> Tuple[bool, dict]:
+    """
+    Heuristically decide if the image is "low-feature" (flat/poor contrast).
+
+    Cues after smoothing & saturation exclusion (mirrors find_foci preproc):
+      - robust_range = (p99 - p1) / median
+      - edge_density = fraction of Sobel magnitudes > med + edge_q * 1.4826*MAD
+      - lap_var      = var(laplace(img / median))
+      - snr          = approx_std / median  (approx_std from 1.4826 * MAD)
+
+    Flags low-feature if at least 2 (of up to 4) cues fail thresholds.
+    """
+    im = np.nan_to_num(img2d.astype(np.float32), copy=False)
+    if sigma > 0:
+        im = gaussian(im, sigma=sigma, preserve_range=True)
+
+    # Exclude saturated regions from stats
+    exclude = np.zeros_like(im, dtype=bool)
+    if remove_saturated:
+        labeled_sat = measure.label(im > sat_thresh)
+        for reg in measure.regionprops(labeled_sat):
+            if reg.area >= sat_min:
+                exclude[tuple(reg.coords.T)] = True
+
+    vp = im[~exclude].ravel()
+    if vp.size == 0:
+        if debug:
+            logger.debug("[LOWFEAT] empty valid region → low-feature")
+        return True, {"robust_range": 0.0, "edge_density": 0.0, "lap_var": 0.0, "snr": 0.0}
+
+    med = float(np.median(vp))
+
+    # Robust range
+    p1, p99 = np.percentile(vp, [1.0, 99.0])
+    robust_range = float((p99 - p1) / max(med, 1e-9))
+
+    # Edge density (Sobel + robust threshold)
+    gmag = np.abs(sobel(im))
+    gv = gmag[~exclude].ravel()
+    gmed = float(np.median(gv)) if gv.size else 0.0
+    gmad = float(np.median(np.abs(gv - gmed))) if gv.size else 0.0
+    gstd = 1.4826 * gmad
+    gthr = gmed + edge_q * gstd
+    edge_density = float(np.mean(gv > gthr)) if gv.size else 0.0
+
+    # Laplacian variance (scale-normalized)
+    imn = im / max(med, 1e-9)
+    lap = ndi.laplace(imn)
+    lap_var = float(np.var(lap[~exclude])) if vp.size else 0.0
+
+    # SNR (same definition as in find_foci logging)
+    mad = float(np.median(np.abs(vp - med)))
+    approx_std = 1.4826 * mad
+    snr = approx_std / max(med, 1e-9)
+
+    # Two-(of up to four)-fails rule
+    fails = (
+        int(robust_range < rr_thresh)
+        + int(edge_density < edge_min_frac)
+        + int(lap_var < lap_var_thresh)
+        + (int(snr < snr_thresh) if snr_thresh is not None else 0)
+    )
+    low_feature = (fails >= 2)
+
+    if debug:
+        logger.debug(
+            "[LOWFEAT] rr=%.4f (<%.3f) | ed=%.4f (<%.3f) | lapvar=%.4e (<%.3e) | snr=%.3f (<%s) → low=%s",
+            robust_range, rr_thresh,
+            edge_density, edge_min_frac,
+            lap_var, lap_var_thresh,
+            snr, f"{snr_thresh:.3f}" if snr_thresh is not None else "—",
+            low_feature,
+        )
+
+    return low_feature, {
+        "robust_range": robust_range,
+        "edge_density": edge_density,
+        "lap_var": lap_var,
+        "snr": snr,
+    }
+
+
+def colocalize_objects_3d(
+    cars_mask_3d: np.ndarray,
+    af_mask_3d: np.ndarray,
+    *,
+    min_overlap: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Label and colocalize in 3-D.
+    Returns: (labeled_pure_lipid_3d, labeled_lipo_lipid_3d, labeled_pure_lipo_3d).
+    """
+    cars_labels = label(cars_mask_3d, connectivity=1)
+    af_labels   = label(af_mask_3d,   connectivity=1)
+
+    labeled_pure_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_pure_lipo  = np.zeros_like(af_labels,   dtype=np.int32)
+
+    consumed_af = set()
+    next_pure_lipid_id = next_lipo_lipid_id = next_pure_lipo_id = 1
+
+    max_cid = int(cars_labels.max())
+    max_aid = int(af_labels.max())
+
+    for cid in range(1, max_cid + 1):
+        cid_mask = (cars_labels == cid)
+        if not np.any(cid_mask):
+            continue
+        af_touch = af_labels[cid_mask]
+        if af_touch.size == 0:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+            continue
+        counts = np.bincount(af_touch, minlength=max_aid + 1)
+        counts[0] = 0
+        best_af = int(np.argmax(counts))
+        best_overlap = int(counts[best_af])
+        if best_af > 0 and best_overlap >= int(min_overlap):
+            labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
+            next_lipo_lipid_id += 1
+            consumed_af.add(best_af)
+        else:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+
+    for aid in range(1, max_aid + 1):
+        if aid in consumed_af:
+            continue
+        aid_mask = (af_labels == aid)
+        if np.any(aid_mask):
+            labeled_pure_lipo[aid_mask] = next_pure_lipo_id
+            next_pure_lipo_id += 1
+
+    return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
