@@ -115,11 +115,11 @@ def analyze_3way_intracellular_objects(
     Quantify pure lipid, lipid+lipofuscin, and pure lipofuscin objects per cell.
 
     For each cell region:
-      - counts/areas of objects per category,
+      - counts/volumes of objects per category,
       - mean intensity per object (CARS for lipid-containing, autofluorescence
         for pure lipofuscin),
       - optional LAMP2 colocalization counts,
-      - per-cell percentages (area / cell area).
+      - per-cell percentages (volume / cell volume).
 
     Returns both per-object records ('results') and per-cell summaries ('summary').
     """
@@ -135,9 +135,11 @@ def analyze_3way_intracellular_objects(
         cell_id = int(cell.label)
         # 3-D mask and counts
         cell_mask_region_3d = (labeled_cells_3d == cell_id)
-        # Keep legacy 2-D "area" fields by projecting the 3-D cell to MIP:
+        # Legacy 2-D "area" fields via MIP (kept for backward compatibility):
         cell_area_px = int(np.max(cell_mask_region_3d, axis=0).sum())
         cell_area_um2 = float(cell_area_px) * (pixel_size_microns**2)
+        # True 3-D cell volume in voxels (new, used for volume percentages):
+        cell_volume_voxels = int(cell_mask_region_3d.sum())
     
         pure_lipid_lamp2_count = 0
         lipid_lipo_lamp2_count = 0
@@ -149,6 +151,11 @@ def analyze_3way_intracellular_objects(
             zz, yy, xx = coords_3d[:, 0], coords_3d[:, 1], coords_3d[:, 2]
             return bool(np.any(lamp2_mask_3d[zz, yy, xx]))
     
+        # Voxel accumulators for volume percentages
+        pure_lipid_voxels_sum = 0
+        lipid_lipofuscin_voxels_sum = 0
+        pure_lipofuscin_voxels_sum = 0
+
         # A) pure lipid (3-D)
         pure_lipid_in_cell = labeled_pure_lipid_3d * cell_mask_region_3d
         pure_lipid_count = 0
@@ -160,6 +167,7 @@ def analyze_3way_intracellular_objects(
             area_um2 = float(voxels) * (pixel_size_microns**2)
             pure_lipid_count += 1
             pure_lipid_area_um2 += area_um2
+            pure_lipid_voxels_sum += voxels
             lamp2_hit = _overlaps_lamp2(region_lipid.coords)
             if lamp2_hit:
                 pure_lipid_lamp2_count += 1
@@ -187,6 +195,7 @@ def analyze_3way_intracellular_objects(
             area_um2 = float(voxels) * (pixel_size_microns**2)
             lipid_lipo_count += 1
             lipid_lipo_area_um2 += area_um2
+            lipid_lipofuscin_voxels_sum += voxels
             lamp2_hit = _overlaps_lamp2(region_ll.coords)
             if lamp2_hit:
                 lipid_lipo_lamp2_count += 1
@@ -218,6 +227,7 @@ def analyze_3way_intracellular_objects(
             area_um2 = float(voxels) * (pixel_size_microns**2)
             pure_lipo_count += 1
             pure_lipo_area_um2 += area_um2
+            pure_lipofuscin_voxels_sum += voxels
             lamp2_hit = _overlaps_lamp2(region_pure_l.coords)
             if lamp2_hit:
                 pure_lipo_lamp2_count += 1
@@ -236,8 +246,8 @@ def analyze_3way_intracellular_objects(
                 }
             )
     
-        def _pct(area_um2: float) -> float:
-            return 100.0 * area_um2 / cell_area_um2 if cell_area_um2 > 0 else 0.0
+        def _pct_vox(vox: int) -> float:
+            return 100.0 * float(vox) / float(cell_volume_voxels) if cell_volume_voxels > 0 else 0.0
     
         summary.append(
             {
@@ -246,15 +256,19 @@ def analyze_3way_intracellular_objects(
                 "cell_id": cell_id,
                 "cell_area": cell_area_px,
                 "cell_area_um2": cell_area_um2,
+                "cell_volume_voxels": cell_volume_voxels,
                 "pure_lipid_count": pure_lipid_count,
                 "pure_lipid_area_um2": pure_lipid_area_um2,
-                "pure_lipid_percentage": _pct(pure_lipid_area_um2),
+                "pure_lipid_voxels": pure_lipid_voxels_sum,
+                "pure_lipid_percentage": _pct_vox(pure_lipid_voxels_sum),
                 "lipid_lipofuscin_count": lipid_lipo_count,
                 "lipid_lipofuscin_area_um2": lipid_lipo_area_um2,
-                "lipid_lipofuscin_percentage": _pct(lipid_lipo_area_um2),
+                "lipid_lipofuscin_voxels": lipid_lipofuscin_voxels_sum,
+                "lipid_lipofuscin_percentage": _pct_vox(lipid_lipofuscin_voxels_sum),
                 "lipofuscin_count": pure_lipo_count,
                 "lipofuscin_area_um2": pure_lipo_area_um2,
-                "lipofuscin_percentage": _pct(pure_lipo_area_um2),
+                "lipofuscin_voxels": pure_lipofuscin_voxels_sum,
+                "lipofuscin_percentage": _pct_vox(pure_lipofuscin_voxels_sum),
                 "pure_lipid_lamp2_count": pure_lipid_lamp2_count,
                 "lipid_lipofuscin_lamp2_count": lipid_lipo_lamp2_count,
                 "lipofuscin_lamp2_count": pure_lipo_lamp2_count,
@@ -415,9 +429,9 @@ def process_nd2_pair(
                         edge_min_frac=0.16,
                         lap_var_thresh=4.8e-3,
                         snr_thresh=0.285,
-                        debug=False,  # set VERBOSE for slice-level prints
+                        debug=VERBOSE,  # set VERBOSE for slice-level prints
                     )
-                    sdmul = 1.6 if low_feat else 0.8
+                    sdmul = 2.4 if low_feat else 1.2
             
                     mask_z = find_foci(
                         z_img,
@@ -447,17 +461,6 @@ def process_nd2_pair(
                 mask_z = find_foci(corrected_cars_stack[z], **foci_params)
                 cars_foci_masks_z.append(mask_z.astype(bool, copy=False))
             cars_foci_mask_3d = np.stack(cars_foci_masks_z, axis=0)  # (Z, H, W) bool
-
-            # Saturation/amyloid-like mask
-            sat_thresh = float(foci_params["saturation_threshold"])  # type: ignore[index]
-            sat_min = int(foci_params["saturated_min_size"])  # type: ignore[index]
-            saturated_pixels = corrected_cars_slice >= sat_thresh
-            labeled_sat = measure.label(saturated_pixels)
-            amyloid_mask = np.zeros_like(corrected_cars_slice, dtype=bool)
-            for region in measure.regionprops(labeled_sat):
-                if region.area >= sat_min:
-                    amyloid_mask[tuple(region.coords.T)] = True
-            amyloid_pct = float(amyloid_mask.sum()) / float(amyloid_mask.size)
 
             # Autofluorescence channel (optional)
             auto_ch_idx = config["channel_map"].get("Autofluorescence")  # type: ignore[index]
@@ -574,6 +577,11 @@ def process_nd2_pair(
                     min_hole_size=fluorescence_params.get("min_hole_size", 20_000),              # type: ignore[index]
                     min_voxels_3d=None,  # set if you want strict 3-D cleanup
                     debug=False,
+                    # NEW: optional bad-slice fallback knobs (all default to "off" if missing)
+                    bad_slice_frac_threshold=fluorescence_params.get("bad_slice_frac_threshold"),
+                    bad_slice_max_components=fluorescence_params.get("bad_slice_max_components"),
+                    bad_slice_use_mip_if_fraction_over=fluorescence_params.get("bad_slice_use_mip_if_fraction_over"),
+                    clip_to_mip_mask=bool(fluorescence_params.get("clip_to_mip_mask", False)),
                 )
                 # 2-D MIPs for displays/overlays stay exactly as before
                 cm_mask = cm_mask_3d.max(axis=0)
@@ -610,7 +618,6 @@ def process_nd2_pair(
                 for s_item in pos_summary:
                     s_item["cell_marker"] = cm_key
                     s_item["myelination_percentage"] = myelin_pct
-                    s_item["amyloid_percentage"] = amyloid_pct
 
                 all_positions_results.extend(pos_results)
                 all_positions_summary.extend(pos_summary)

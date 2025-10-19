@@ -166,6 +166,11 @@ def process_fluorescence_stack(
     min_hole_size: int = 20_000,
     min_voxels_3d: Optional[int] = None,
     debug: bool = False,
+    # NEW: optional fallback knobs (all disabled by default)
+    bad_slice_frac_threshold: Optional[float] = None,
+    bad_slice_max_components: Optional[int] = None,
+    bad_slice_use_mip_if_fraction_over: Optional[float] = None,
+    clip_to_mip_mask: bool = False,
 ) -> np.ndarray:
     """
     Build a 3-D cell mask by applying `process_fluorescence_channel` to each z-slice
@@ -175,6 +180,8 @@ def process_fluorescence_stack(
         raise ValueError(f"Expected a (Z,H,W) stack, got shape {stack_3d.shape}")
 
     masks = []
+    per_slice_fracs: list[float] = []
+    per_slice_comps: list[int] = []
     for z in range(stack_3d.shape[0]):
         mz = process_fluorescence_channel(
             stack_3d[z],
@@ -190,8 +197,54 @@ def process_fluorescence_stack(
             min_hole_size=min_hole_size,
             debug=(debug and z == 0),
         )
-        masks.append(mz.astype(bool, copy=False))
+        mz = mz.astype(bool, copy=False)
+        masks.append(mz)
+        # badness metrics (only if thresholds provided later)
+        frac = float(np.count_nonzero(mz)) / float(mz.size) if mz.size else 0.0
+        per_slice_fracs.append(frac)
+        # component count to catch explosions
+        labeled = measure.label(mz, connectivity=1)
+        per_slice_comps.append(int(labeled.max()))
     m3d = np.stack(masks, axis=0)
+
+    # --- NEW: Pathological-slice fallback using a robust MIP mask ---
+    use_frac = (bad_slice_frac_threshold is not None)
+    use_comp = (bad_slice_max_components is not None)
+    use_many = (bad_slice_use_mip_if_fraction_over is not None)
+    if use_frac or use_comp or clip_to_mip_mask:
+        # Build MIP mask once with the same params
+        mip = np.max(stack_3d, axis=0) if stack_3d.size else np.zeros_like(stack_3d[0])
+        mip_mask = process_fluorescence_channel(
+            mip,
+            cell_size=cell_size,
+            min_size=min_size,
+            closing_radius=closing_radius,
+            gaussian_sigma=gaussian_sigma,
+            fill_holes=fill_holes,
+            threshold_method=threshold_method,
+            offset=offset,
+            exclude_dark_regions=exclude_dark_regions,
+            dark_threshold=dark_threshold,
+            min_hole_size=min_hole_size,
+            debug=False,
+        ).astype(bool, copy=False)
+
+        bad_idx: np.ndarray | None = None
+        if use_frac or use_comp:
+            import numpy as _np
+            bad_by_frac = _np.array(per_slice_fracs) >= (bad_slice_frac_threshold or 1.1)  # off if None
+            bad_by_comp = _np.array(per_slice_comps) >= (bad_slice_max_components or _np.iinfo(_np.int32).max)
+            bad_idx = _np.where(bad_by_frac | bad_by_comp)[0]
+
+            if bad_idx.size > 0:
+                if use_many and (bad_idx.size / m3d.shape[0]) >= float(bad_slice_use_mip_if_fraction_over):
+                    m3d[:, :, :] = mip_mask[None, :, :]
+                else:
+                    m3d[bad_idx, :, :] = mip_mask[None, :, :]
+
+        if clip_to_mip_mask:
+            m3d = m3d & mip_mask[None, :, :]
+
     if min_voxels_3d and min_voxels_3d > 1:
         m3d = remove_small_objects(m3d, min_size=int(min_voxels_3d), connectivity=1)
     return m3d
@@ -463,8 +516,8 @@ def colocalize_objects_3d(
     Label and colocalize in 3-D.
     Returns: (labeled_pure_lipid_3d, labeled_lipo_lipid_3d, labeled_pure_lipo_3d).
     """
-    cars_labels = label(cars_mask_3d, connectivity=1)
-    af_labels   = label(af_mask_3d,   connectivity=1)
+    cars_labels = label(cars_mask_3d, connectivity=2)
+    af_labels   = label(af_mask_3d,   connectivity=2)
 
     labeled_pure_lipid = np.zeros_like(cars_labels, dtype=np.int32)
     labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
@@ -480,6 +533,8 @@ def colocalize_objects_3d(
         cid_mask = (cars_labels == cid)
         if not np.any(cid_mask):
             continue
+        # 3-D size (voxel count) for this lipid object
+        size_lipid = int(np.count_nonzero(cid_mask))
         af_touch = af_labels[cid_mask]
         if af_touch.size == 0:
             labeled_pure_lipid[cid_mask] = next_pure_lipid_id
@@ -489,10 +544,16 @@ def colocalize_objects_3d(
         counts[0] = 0
         best_af = int(np.argmax(counts))
         best_overlap = int(counts[best_af])
+        # Apply the size-ratio gate in 3-D: AF size within [0.5x, 2.0x] of lipid size
         if best_af > 0 and best_overlap >= int(min_overlap):
-            labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
-            next_lipo_lipid_id += 1
-            consumed_af.add(best_af)
+            size_af = int(np.count_nonzero(af_labels == best_af))
+            if (size_af >= 0.5 * size_lipid) and (size_af <= 2.0 * size_lipid):
+                labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
+                next_lipo_lipid_id += 1
+                consumed_af.add(best_af)
+            else:
+                labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+                next_pure_lipid_id += 1
         else:
             labeled_pure_lipid[cid_mask] = next_pure_lipid_id
             next_pure_lipid_id += 1

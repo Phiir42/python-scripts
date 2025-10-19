@@ -14,7 +14,7 @@ VERBOSE: bool = True
 PEAKFIT_DEBUG: bool = True  # set True to display per-droplet fit plots
 
 # Derived log level aligned to VERBOSE (entry-point should still configure handlers)
-LOG_LEVEL: Final[int] = logging.INFO if VERBOSE else logging.WARNING
+LOG_LEVEL: Final[int] = logging.DEBUG if VERBOSE else logging.WARNING
 
 # Suppress excessive logs from nd2reader regardless of VERBOSE
 logging.getLogger("nd2reader").setLevel(logging.ERROR)

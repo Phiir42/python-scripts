@@ -27,7 +27,11 @@ config = {
             "gaussian_sigma": 2,
             "fill_holes": True,
             "threshold_method": "otsu",  # fallback
-            "offset": 1.0               # fallback
+            "offset": 1.0,
+            "bad_slice_frac_threshold": 0.55,
+            "bad_slice_max_components": None,
+            "bad_slice_use_mip_if_fraction_over": 0.34,
+            "clip_to_mip_mask": True
         },
         "nuclei_params": {
             "cell_size": 5000,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import cv2
 import matplotlib.pyplot as plt
@@ -14,15 +14,14 @@ import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 from nd2reader import ND2Reader
 from skimage import measure
+from skimage.morphology import dilation, disk
 
 from .config_utils import resolve_marker_name
 from .constants import CARS_CH, LOG_LEVEL, PEAKFIT_DEBUG, VERBOSE
 from .debug_utils import save_alignment_triptych
 from .filters import apply_east_shadows_filter
-from .imaging import get_fluorescence_stack
-from .segmentation import find_foci, process_fluorescence_stack, colocalize_objects_3d
+from .segmentation import find_foci, process_fluorescence_channel
 from .peakfit import fit_cars_peaks, _plot_peak_fit_debug
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(LOG_LEVEL)
@@ -77,6 +76,74 @@ def _normalize_row_max(y: np.ndarray, eps: float = 1e-9) -> tuple[np.ndarray, fl
     m = float(np.max(y_clean))
     m = m if m > eps else 1.0
     return y_clean / m, m
+
+
+def _colocalize_objects(
+    cars_mask: np.ndarray,
+    af_mask: np.ndarray,
+    min_overlap: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return labeled masks (pure_lipid, lipid+lipofuscin, pure_lipofuscin)
+    using object-level colocalization with voxel-overlap >= min_overlap.
+    """
+    cars_labels = measure.label(cars_mask)
+    af_labels   = measure.label(af_mask)
+
+    labeled_pure_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
+    labeled_pure_lipo  = np.zeros_like(af_labels,   dtype=np.int32)
+
+    consumed_af: Set[int] = set()
+    next_pure_lipid_id = 1
+    next_lipo_lipid_id = 1
+    next_pure_lipo_id  = 1
+
+    max_cid = int(cars_labels.max())
+    for cid in range(1, max_cid + 1):
+        cid_mask = (cars_labels == cid)
+        if not np.any(cid_mask):
+            continue
+        # Size of the lipid object (in pixels)
+        size_lipid = int(np.count_nonzero(cid_mask))
+
+        af_touch = af_labels[cid_mask]
+        if af_touch.size == 0:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+            continue
+
+        counts = np.bincount(af_touch, minlength=int(af_labels.max()) + 1)
+        counts[0] = 0
+        best_af = int(np.argmax(counts))
+        best_overlap = int(counts[best_af])
+
+        # Additional size-ratio gate: AF size must be within [0.5x, 2.0x] of the lipid size
+        if best_af > 0 and best_overlap >= int(min_overlap):
+            size_af = int(np.count_nonzero(af_labels == best_af))
+            if (size_af >= 0.5 * size_lipid) and (size_af <= 2.0 * size_lipid):
+                labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
+                next_lipo_lipid_id += 1
+                consumed_af.add(best_af)
+            else:
+                # Size mismatch: treat as pure lipid; do NOT consume AF
+                labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+                next_pure_lipid_id += 1
+        else:
+            labeled_pure_lipid[cid_mask] = next_pure_lipid_id
+            next_pure_lipid_id += 1
+
+    max_aid = int(af_labels.max())
+    for aid in range(1, max_aid + 1):
+        if aid in consumed_af:
+            continue
+        aid_mask = (af_labels == aid)
+        if not np.any(aid_mask):
+            continue
+        labeled_pure_lipo[aid_mask] = next_pure_lipo_id
+        next_pure_lipo_id += 1
+
+    return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
 
 
 def _save_labeled_mask_images(
@@ -536,7 +603,7 @@ def compute_myelin_average_for_series(
 
     # 5) Repair glitches (fit routine normalizes internally).
     y_repaired = _repair_zero_glitches(y)
-    _, scale = _normalize_row_max(y_repaired)  # kept for QA
+    y_norm, scale = _normalize_row_max(y_repaired)  # kept for QA
 
     # 6) Fit using the same routine as droplets.
     series = os.path.basename(spectrum_folder)
@@ -584,6 +651,7 @@ def process_hyperspectral_series(
     - Export Raw/Normalized/Peak Fits sheets and a summary figure + ratio heatmap.
     """
     from skimage.filters import gaussian
+    from .analysis import max_project_fluorescence  # local import avoids circular
     from .peakfit import start_debug_capture, chi2_add  # import here once
     from .visualize import debug_display_3way_segmentation
 
@@ -669,38 +737,17 @@ def process_hyperspectral_series(
     if best_v is None:  # safety fallback
         best_v = 0
     cars_img_for_overlay = mask_image
-    
-    # Build corrected CARS stack at best_v (Z,H,W) and per-slice foci masks (3-D)
-    with ND2Reader(cars_nd2_path) as cars_nd2_for_masks:
-        z_slices = cars_nd2_for_masks.sizes.get("z", 1)
-        cars_stack_corr = []
-        for z in range(z_slices):
-            raw_sl = np.nan_to_num(cars_nd2_for_masks.get_frame_2D(v=best_v, c=CARS_CH, z=z)).astype(np.float32)
-            filtered = apply_east_shadows_filter(raw_sl)
-            den = np.clip(reference_image, 1e-6, None)
-            corrected = filtered / den
-            if foci_params.get("sigma", 0) > 0:
-                corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
-            cars_stack_corr.append(corrected)
-        cars_stack_corr = np.stack(cars_stack_corr, axis=0)  # (Z,H,W)
-    
-    cars_foci_mask_3d = np.stack(
-        [find_foci(cars_stack_corr[z], **foci_params).astype(bool, copy=False) for z in range(cars_stack_corr.shape[0])],
-        axis=0
-    )
 
-    # --- Build cell/auto/LAMP2 masks from fluorescence ND2 (now 3-D stacks) ---
+    # --- Build cell/auto/LAMP2 masks from fluorescence ND2 ---
     with ND2Reader(fluor_nd2_path) as fl_nd2:
-        # 3-D cell-marker stack (Z,H,W)
-        cm_stack = get_fluorescence_stack(
+        ch_idx = config["channel_map"][cell_marker]
+        fluoro_mip = max_project_fluorescence(
             fl_nd2,
-            int(config["channel_map"][cell_marker]),
-            best_v,
-            config["morphology_params"]["fluorescence_params"],
+            ch_index=ch_idx,
+            position=best_v,
+            fluoro_params=config["morphology_params"]["fluorescence_params"],
         )
-        # 2-D MIP for display/diagnostics (unchanged visuals)
-        fluoro_mip = cm_stack.max(axis=0)
-    
+
         # DEBUG: save alignment triptych (Hyperspec 2850, matched Fluor z, matched CARS z)
         try:
             if config.get("debug_alignment", False) or VERBOSE:
@@ -715,7 +762,7 @@ def process_hyperspectral_series(
                             corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
                         mip_slices_dbg.append(corrected)
                     cars_mip_best = np.max(np.stack(mip_slices_dbg, axis=0), axis=0)
-    
+
                 out_dir = os.path.join(config["paths"]["data_directory"], config.get("debug_output_dir", "Debug"))
                 out_png = os.path.join(out_dir, f"align_{folder_base}_z{best_v}_r{best_r:.3f}.png")
                 save_alignment_triptych(
@@ -731,53 +778,46 @@ def process_hyperspectral_series(
         except Exception as exc:
             if VERBOSE:
                 logger.info("[DEBUG] alignment triptych failed: %s", exc)
-    
-        # Autofluorescence: 3-D stack + per-slice masks; keep MIP for panel previews
-        auto_mask_3d = np.zeros_like(cm_stack, dtype=bool)
-        auto_mip = None
+
         auto_ch = config["channel_map"].get("Autofluorescence")
         if auto_ch is not None:
-            auto_stack = get_fluorescence_stack(
-                fl_nd2,
-                int(auto_ch),
-                best_v,
-                config["morphology_params"]["autofluorescence_params"],
-            )
-            auto_mip = auto_stack.max(axis=0)
-            af_masks = [
-                find_foci(auto_stack[z], **config["morphology_params"]["autofluorescence_params"])
-                for z in range(auto_stack.shape[0])
-            ]
-            auto_mask_3d = np.stack([m.astype(bool, copy=False) for m in af_masks], axis=0)
-    
-        # LAMP2: 3-D stack + per-slice masks (with light dilation), MIP only for previews
-        lamp2_mask_3d = None
+            with ND2Reader(fluor_nd2_path) as fl_nd22:
+                auto_mip = max_project_fluorescence(
+                    fl_nd22,
+                    ch_index=auto_ch,
+                    position=best_v,
+                    fluoro_params=config["morphology_params"]["autofluorescence_params"],
+                )
+            auto_mask = find_foci(auto_mip, **config["morphology_params"]["autofluorescence_params"], debug=VERBOSE)
+        else:
+            auto_mip = None
+            auto_mask = np.zeros_like(mask_image, dtype=bool)
+
+        lamp2_mask = None
         lamp2_ch = config["channel_map"].get("LAMP2")
         if lamp2_ch is not None:
-            lamp2_stack = get_fluorescence_stack(
-                fl_nd2,
-                int(lamp2_ch),
-                best_v,
-                config["morphology_params"]["fluorescence_params"],
-            )
+            with ND2Reader(fluor_nd2_path) as fl_nd22:
+                lamp2_mip = max_project_fluorescence(
+                    fl_nd22,
+                    ch_index=lamp2_ch,
+                    position=best_v,
+                    fluoro_params=config["morphology_params"]["fluorescence_params"],
+                )
             lamp2_params = config["morphology_params"].get(
-                "lamp2_params",
-                config["morphology_params"]["autofluorescence_params"],
+                "lamp2_params", config["morphology_params"]["autofluorescence_params"]
             )
-            from skimage.morphology import dilation, disk
-            lzs = [dilation(find_foci(lamp2_stack[z], **lamp2_params), disk(1))
-                   for z in range(lamp2_stack.shape[0])]
-            lamp2_mask_3d = np.stack([lz.astype(bool, copy=False) for lz in lzs], axis=0)
-        lamp2_available = lamp2_mask_3d is not None
+            lamp2_mask = find_foci(lamp2_mip, **lamp2_params, debug=VERBOSE)
+            lamp2_mask = dilation(lamp2_mask, disk(1))
+        lamp2_available = lamp2_mask is not None
 
-    # --- Cell mask thresholding with per-marker overrides (3-D, then MIP for visuals) ---
+    # --- Cell mask thresholding with per-marker overrides ---
     fluorescence_params = config["morphology_params"]["fluorescence_params"]
     marker_thresholds = config.get("marker_thresholds", {}).get(cell_marker, {})
     threshold_method = marker_thresholds.get("threshold_method", fluorescence_params.get("threshold_method", "otsu"))
     offset_val = marker_thresholds.get("offset", fluorescence_params.get("offset", 1.0))
-    
-    cell_mask_3d = process_fluorescence_stack(
-        cm_stack,
+
+    cell_mask = process_fluorescence_channel(
+        fluoro_mip,
         cell_size=fluorescence_params["cell_size"],
         min_size=fluorescence_params["min_size"],
         closing_radius=fluorescence_params["closing_radius"],
@@ -787,37 +827,40 @@ def process_hyperspectral_series(
         offset=offset_val,
         exclude_dark_regions=fluorescence_params.get("exclude_dark_regions", True),
         dark_threshold=fluorescence_params.get("dark_threshold", 50),
-        min_hole_size=fluorescence_params.get("min_hole_size", 20_000),
-        min_voxels_3d=None,
+        min_hole_size=fluorescence_params.get("min_hole_size", 20000),
         debug=False,
     )
-    cell_mask_2d = cell_mask_3d.max(axis=0)  # for overlays / debugging panels
+
+    # --- Droplet masks and overlays ---
+    cars_foci_mask = find_foci(mask_image, **foci_params)
     
-    # --- 3-D colocalization (match analysis.py) ---
+    # Use the same rule as analysis.py: overlap threshold = min_size used to detect CARS foci
     min_overlap = int(foci_params.get("min_size", 20))
-    labeled_pure_lipid_3d, labeled_lipo_lipid_3d, labeled_pure_lipo_3d = colocalize_objects_3d(
-        cars_foci_mask_3d,
-        auto_mask_3d,
+    
+    labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo = _colocalize_objects(
+        cars_foci_mask,
+        auto_mask if auto_mip is not None else np.zeros_like(cars_foci_mask, dtype=bool),
         min_overlap=min_overlap,
     )
     
-    # 2-D projections ONLY for debug/overlays (unchanged visuals)
-    pure_lipid_mask        = (labeled_pure_lipid_3d.max(axis=0)   > 0)
-    lipid_lipofuscin_mask  = (labeled_lipo_lipid_3d.max(axis=0)   > 0)
-    pure_lipofuscin_mask   = (labeled_pure_lipo_3d.max(axis=0)    > 0)
-    lipid_mask             = pure_lipid_mask | lipid_lipofuscin_mask
+    # Boolean views for visualization and downstream logic
+    pure_lipid_mask        = (labeled_pure_lipid > 0)
+    lipid_lipofuscin_mask  = (labeled_lipo_lipid > 0)
+    pure_lipofuscin_mask   = (labeled_pure_lipo > 0)
     
-    # For previews, keep 2-D cell mask; 3-D mask is used later for “intracellular” truth
-    intracellular_pure_lipid        = pure_lipid_mask & cell_mask_2d
-    intracellular_lipid_lipofuscin  = lipid_lipofuscin_mask & cell_mask_2d
-    intracellular_pure_lipofuscin   = pure_lipofuscin_mask & cell_mask_2d
+    # “Lipid” = any CARS-positive droplet (pure lipid or lipid+lipofuscin)
+    lipid_mask = pure_lipid_mask | lipid_lipofuscin_mask
+    
+    intracellular_pure_lipid        = pure_lipid_mask & cell_mask
+    intracellular_lipid_lipofuscin  = lipid_lipofuscin_mask & cell_mask
+    intracellular_pure_lipofuscin   = pure_lipofuscin_mask & cell_mask
 
     if VERBOSE:
         debug_display_3way_segmentation(
             intracellular_pure_lipid,
             intracellular_lipid_lipofuscin,
             intracellular_pure_lipofuscin,
-            cell_mask_2d,
+            cell_mask,
             auto_image=auto_mip,
             cars_image=cars_img_for_overlay,
             pos_index=best_v,
@@ -825,54 +868,34 @@ def process_hyperspectral_series(
         )
         visualize_hyperspectral_mask_overlay(mask_image, lipid_mask)
 
-    # --- Per-droplet intensity table (iterate 3-D objects; compute on 2-D frames) ---
-    # We'll give every 3-D object a unique 2-D ID for images/heatmaps.
-    H, W = mask_image.shape
-    lipid_labels_2d = np.zeros((H, W), dtype=np.int32)
-    next_id = 1
-    rows_out: List[List[Any]] = []
-    
-    def _add_rows_from_3d(labeled_3d: np.ndarray, category_name: str) -> None:
-        nonlocal next_id, lipid_labels_2d, rows_out
-        for r in measure.regionprops(labeled_3d):
-            # 3-D coords → 2-D footprint (unique (y,x))
-            coords = r.coords  # (N,3) => z,y,x
-            yyx = coords[:, 1:3]
-            yyx_unique = np.unique(yyx, axis=0)
-            rr, cc = yyx_unique[:, 0], yyx_unique[:, 1]
-    
-            # Give this 3-D object a new 2-D label ID (for output images/ratio map)
-            this_id = next_id
-            next_id += 1
-            lipid_labels_2d[rr, cc] = this_id
-    
-            # Spectra (average per 2-D frame over (rr,cc))
-            intensities = [float(np.mean(img[rr, cc])) for img in corrected_images]
-    
-            # Intracellular? (true 3-D test)
-            is_intra = bool(np.any(cell_mask_3d[coords[:, 0], coords[:, 1], coords[:, 2]]))
-            location = "Intracellular" if is_intra else "Extracellular"
-            marker_for_row = cell_marker if is_intra else ""
-    
-            # LAMP2 3-D colocalization (optional)
-            lamp2_coloc = False
-            if lamp2_available and lamp2_mask_3d is not None:
-                lamp2_coloc = bool(np.any(lamp2_mask_3d[coords[:, 0], coords[:, 1], coords[:, 2]]))
-    
-            rows_out.append([this_id, category_name, location, marker_for_row, lamp2_coloc] + intensities)
-    
-    # Accumulate rows from each 3-D class
-    _add_rows_from_3d(labeled_pure_lipid_3d,       "Lipid")
-    _add_rows_from_3d(labeled_lipo_lipid_3d,       "Lipidated Lipofuscin")
-    _add_rows_from_3d(labeled_pure_lipo_3d,        "Lipofuscin")
-    
-    # Save labeled 2-D image with numeric IDs drawn on the 2-D footprints
-    _save_labeled_mask_images(lipid_labels_2d, mask_image, spectrum_folder)
-    
-    # Build dataframe
+    # --- Per-droplet intensity table ---
+    lipid_labels = measure.label(lipid_mask)
+    _save_labeled_mask_images(lipid_labels, mask_image, spectrum_folder)
+
+    lipid_data: List[List[Any]] = []
+    cell_marker_report = cell_marker  # report only if intracellular
+    for region in measure.regionprops(lipid_labels):
+        lipid_id = region.label
+        r0, c0 = (int(region.centroid[0]), int(region.centroid[1]))
+
+        if pure_lipid_mask[r0, c0]:
+            category = "Lipid"
+        elif lipid_lipofuscin_mask[r0, c0]:
+            category = "Lipidated Lipofuscin"
+        else:
+            category = "Lipofuscin"
+
+        intensities = [np.mean(img[region.coords[:, 0], region.coords[:, 1]]) for img in corrected_images]
+        is_intra = np.any(cell_mask[region.coords[:, 0], region.coords[:, 1]])
+        location = "Intracellular" if is_intra else "Extracellular"
+        marker_for_row = cell_marker_report if is_intra else ""
+        lamp2_coloc = bool(lamp2_available and np.any(lamp2_mask[region.coords[:, 0], region.coords[:, 1]]))
+
+        lipid_data.append([lipid_id, category, location, marker_for_row, lamp2_coloc] + intensities)
+
     wnum_cols = [f"Wavenumber {i + 1}" for i in range(32)]
     columns_raw = ["Lipid ID", "Category", "Location", "Cell Marker", "LAMP2_Coloc"] + wnum_cols
-    lipid_df_raw = pd.DataFrame(rows_out, columns=columns_raw)
+    lipid_df_raw = pd.DataFrame(lipid_data, columns=columns_raw)
 
     # --- Normalized sheet and header rows for raw sheet ---
     def compute_wavenumber(lambda_nm: float) -> float:
@@ -975,7 +998,7 @@ def process_hyperspectral_series(
         logger.info("[SummaryPlot] Skipping batch summary: %s", exc)
 
     # --- Ratio heatmap (2930 / 2850) ---
-    ratio_map = np.full_like(lipid_labels_2d, fill_value=-1, dtype=np.float32)
+    ratio_map = np.full_like(lipid_labels, fill_value=-1, dtype=np.float32)
     ratio_values: List[float] = []
 
     col_2850 = "Wavenumber 9"
@@ -989,7 +1012,7 @@ def process_hyperspectral_series(
         intens_2850 = row[i_2850]
         intens_2930 = row[i_2930]
         ratio_val = (intens_2930 / intens_2850) if (intens_2850 > 0) else 0.0
-        ratio_map[lipid_labels_2d == lipid_id] = ratio_val
+        ratio_map[lipid_labels == lipid_id] = ratio_val
         ratio_values.append(ratio_val)
 
     if len(ratio_values) == 0:
