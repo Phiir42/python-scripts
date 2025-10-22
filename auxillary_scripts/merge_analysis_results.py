@@ -83,6 +83,20 @@ for subdir in PARENT_DIR.iterdir():
         print(f"  Error reading Summary sheet: {e}")
         continue
 
+    # ── FILTER BLOCK: drop rows with cell_volume_voxels < 10000 ──────────────
+    MIN_VOXELS = 10_000
+    if "cell_volume_voxels" in df_summary.columns:
+        # Coerce to numeric in case the column comes in as object/strings
+        vol = pd.to_numeric(df_summary["cell_volume_voxels"], errors="coerce")
+        before = len(df_summary)
+        df_summary = df_summary[vol >= MIN_VOXELS].copy()
+        removed = before - len(df_summary)
+        if removed > 0:
+            print(f"  Filtered {removed} row(s) with cell_volume_voxels < {MIN_VOXELS}.")
+    else:
+        print("  [WARN] 'cell_volume_voxels' not found in Summary; no volume filter applied.")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Route each row (robust to variants)
     for _, row in df_summary.iterrows():
         fname = str(row.get("file_name", "") or "").strip()

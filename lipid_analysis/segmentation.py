@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List, Set
 
 import numpy as np
 from scipy import ndimage as ndi
@@ -511,10 +511,18 @@ def colocalize_objects_3d(
     af_mask_3d: np.ndarray,
     *,
     min_overlap: int,
+    af_multi_min_count: int = 3,
+    af_cover_frac: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Label and colocalize in 3-D.
     Returns: (labeled_pure_lipid_3d, labeled_lipo_lipid_3d, labeled_pure_lipo_3d).
+
+    Extended logic identical to the 2-D path:
+    - If one AF component touches many CARS components (>= af_multi_min_count)
+      or the total overlapped voxels cover >= af_cover_frac of the AF volume,
+      assign *all* touching CARS to lipidated lipofuscin (no size gate).
+    - Otherwise, fall back to one-to-one pairing with the original size-ratio gate.
     """
     cars_labels = label(cars_mask_3d, connectivity=2)
     af_labels   = label(af_mask_3d,   connectivity=2)
@@ -523,18 +531,59 @@ def colocalize_objects_3d(
     labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
     labeled_pure_lipo  = np.zeros_like(af_labels,   dtype=np.int32)
 
-    consumed_af = set()
-    next_pure_lipid_id = next_lipo_lipid_id = next_pure_lipo_id = 1
-
     max_cid = int(cars_labels.max())
     max_aid = int(af_labels.max())
 
+    if max_cid == 0 and max_aid == 0:
+        return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
+
+    cars_sizes = np.bincount(cars_labels.ravel(), minlength=max_cid + 1)
+    af_sizes   = np.bincount(af_labels.ravel(),   minlength=max_aid + 1)
+
+    # Build AF -> list of (cid, overlap)
+    af_to_cids: Dict[int, List[Tuple[int, int]]] = {aid: [] for aid in range(1, max_aid + 1)}
     for cid in range(1, max_cid + 1):
         cid_mask = (cars_labels == cid)
         if not np.any(cid_mask):
             continue
-        # 3-D size (voxel count) for this lipid object
-        size_lipid = int(np.count_nonzero(cid_mask))
+        af_touch = af_labels[cid_mask]
+        if af_touch.size == 0:
+            continue
+        counts = np.bincount(af_touch, minlength=max_aid + 1)
+        counts[0] = 0
+        for aid in np.nonzero(counts >= int(min_overlap))[0]:
+            af_to_cids[int(aid)].append((cid, int(counts[int(aid)])))
+
+    consumed_af: Set[int] = set()
+    assigned_cids: Set[int] = set()
+    next_pure_lipid_id = 1
+    next_lipo_lipid_id = 1
+    next_pure_lipo_id  = 1
+
+    # Pass 1: multi-pair rule
+    for aid, pairs in af_to_cids.items():
+        if not pairs:
+            continue
+        total_overlap = sum(ov for _, ov in pairs)
+        n_touching = len(pairs)
+        size_af = int(af_sizes[aid])
+        if (n_touching >= af_multi_min_count) or (size_af > 0 and (total_overlap / size_af) >= af_cover_frac):
+            for cid, _ in pairs:
+                if cid in assigned_cids:
+                    continue
+                labeled_lipo_lipid[cars_labels == cid] = next_lipo_lipid_id
+                next_lipo_lipid_id += 1
+                assigned_cids.add(cid)
+            consumed_af.add(aid)
+
+    # Pass 2: standard size-ratio-gated matching
+    for cid in range(1, max_cid + 1):
+        if cid in assigned_cids:
+            continue
+        cid_mask = (cars_labels == cid)
+        if not np.any(cid_mask):
+            continue
+        size_lipid = int(cars_sizes[cid])
         af_touch = af_labels[cid_mask]
         if af_touch.size == 0:
             labeled_pure_lipid[cid_mask] = next_pure_lipid_id
@@ -544,9 +593,8 @@ def colocalize_objects_3d(
         counts[0] = 0
         best_af = int(np.argmax(counts))
         best_overlap = int(counts[best_af])
-        # Apply the size-ratio gate in 3-D: AF size within [0.5x, 2.0x] of lipid size
         if best_af > 0 and best_overlap >= int(min_overlap):
-            size_af = int(np.count_nonzero(af_labels == best_af))
+            size_af = int(af_sizes[best_af])
             if (size_af >= 0.5 * size_lipid) and (size_af <= 2.0 * size_lipid):
                 labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
                 next_lipo_lipid_id += 1

@@ -4,8 +4,8 @@ from pathlib import Path
 import pandas as pd
 
 # --------- USER-EDITABLE SETTINGS (test mode) ---------
-INPUT_FILE = Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\AD3a\Hyperspectral_Myelin_AverageFits.xlsx")
-OUTPUT_FILE = Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\Myelin_Ratio_ByClinicogenotype.xlsx")
+INPUT_FILE = Path(r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD3a\Hyperspectral_Myelin_AverageFits.xlsx")
+OUTPUT_FILE = Path(r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\Myelin_Ratio_ByClinicogenotype.xlsx")
 
 # Sheet names for output (Excel-safe: no / \ ? * [ ] : )
 SHEET_ALL = "All frames"
@@ -65,7 +65,7 @@ def process_single_file(xlsx_path: Path) -> pd.DataFrame:
 
 def main():
     # Root directory containing session subfolders (AD3a, AD3b, ..., AD4f, etc.)
-    ROOT = Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025")
+    ROOT = Path(r"D:\OneDrive - Stanford\Research Documents\AD Project\2025")
     pattern = "Hyperspectral_Myelin_AverageFits.xlsx"
 
     files = sorted(ROOT.rglob(pattern))

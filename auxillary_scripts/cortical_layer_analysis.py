@@ -7,8 +7,7 @@ SUBCOLUMNS = [
     "Lipids",
     "Lipidated Lipofuscin",
     "Lipofuscin",
-    "Myelination",
-    "Amyloid"
+    "Myelination"
 ]
 
 # Only these acquisition files are eligible for cortical-layer stratification.
@@ -156,8 +155,7 @@ def main():
             'pure_lipid_percentage',
             'lipid_lipofuscin_percentage',
             'lipofuscin_percentage',
-            'myelination_percentage',
-            'amyloid_percentage'
+            'myelination_percentage'
         ]
         if not all(col in df.columns for col in required_cols):
             print(f"Skipping '{sheet_name}' - missing required columns.")
@@ -176,7 +174,6 @@ def main():
             llf = row_data['lipid_lipofuscin_percentage']
             lpf = row_data['lipofuscin_percentage']
             mb  = row_data['myelination_percentage']
-            ap  = row_data['amyloid_percentage']
             
             layer = determine_layer(fn, zs)            # ← use normalized fn
             if layer is None:
@@ -186,7 +183,7 @@ def main():
             # Store in grouped_data
             if fn not in grouped_data:
                 grouped_data[fn] = {i: [] for i in range(1,8)}
-            grouped_data[fn][layer].append((int(zs) if pd.notna(zs) else None, pl, llf, lpf, mb, ap))
+            grouped_data[fn][layer].append((int(zs) if pd.notna(zs) else None, pl, llf, lpf, mb))
 
         # Now we’ll write the data. Start from row=3 (below the headers).
         current_row = 3

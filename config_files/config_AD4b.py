@@ -76,13 +76,16 @@ config = {
             "saturated_min_size": 5000
         },
         "autofluorescence_params": {
-            "sigma": 2,
-            "min_distance": 15,
+            "sigma": 1.5,
+            "min_distance": 6,
             "min_size": 35,
             "std_dev_multiplier": 3,
             "remove_saturated": True,
             "saturation_threshold": 2500,
-            "saturated_min_size": 5000
+            "saturated_min_size": 100,
+            "separate_objects": True,
+            "morph_op": "opening",
+            "morph_radius": 1
         },
         "lamp2_params": {
             "sigma": 2,

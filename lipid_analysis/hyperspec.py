@@ -82,10 +82,21 @@ def _colocalize_objects(
     cars_mask: np.ndarray,
     af_mask: np.ndarray,
     min_overlap: int,
+    *,
+    af_multi_min_count: int = 3,
+    af_cover_frac: float = 0.25,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Return labeled masks (pure_lipid, lipid+lipofuscin, pure_lipofuscin)
     using object-level colocalization with voxel-overlap >= min_overlap.
+
+    Extended logic:
+    - If a single AF object touches >= `af_multi_min_count` CARS objects
+      (each meeting `min_overlap`) OR the union of overlaps covers at least
+      `af_cover_frac` of the AF object's voxels, we pair *all* touching CARS
+      objects to that AF object (lipidated lipofuscin) and consume the AF object,
+      **without** enforcing the size-ratio gate. This handles merged AF granules.
+    - Otherwise we fall back to one-to-one pairing with the original size-ratio gate.
     """
     cars_labels = measure.label(cars_mask)
     af_labels   = measure.label(af_mask)
@@ -94,54 +105,91 @@ def _colocalize_objects(
     labeled_lipo_lipid = np.zeros_like(cars_labels, dtype=np.int32)
     labeled_pure_lipo  = np.zeros_like(af_labels,   dtype=np.int32)
 
+    # Sizes
+    max_cid = int(cars_labels.max())
+    max_aid = int(af_labels.max())
+    if max_cid == 0 and max_aid == 0:
+        return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
+
+    cars_sizes = np.bincount(cars_labels.ravel(), minlength=max_cid + 1)
+    af_sizes   = np.bincount(af_labels.ravel(),   minlength=max_aid + 1)
+
+    # Build AF -> list of (cid, overlap) for cid that touch this AF with >= min_overlap
+    af_to_cids: Dict[int, List[Tuple[int, int]]] = {aid: [] for aid in range(1, max_aid + 1)}
+    for cid in range(1, max_cid + 1):
+        cid_mask = (cars_labels == cid)
+        if not cid_mask.any():
+            continue
+        af_touch = af_labels[cid_mask]
+        if af_touch.size == 0:
+            continue
+        counts = np.bincount(af_touch, minlength=max_aid + 1)
+        counts[0] = 0
+        for aid in np.nonzero(counts >= int(min_overlap))[0]:
+            af_to_cids[int(aid)].append((cid, int(counts[int(aid)])))
+
     consumed_af: Set[int] = set()
     next_pure_lipid_id = 1
     next_lipo_lipid_id = 1
     next_pure_lipo_id  = 1
 
-    max_cid = int(cars_labels.max())
-    for cid in range(1, max_cid + 1):
-        cid_mask = (cars_labels == cid)
-        if not np.any(cid_mask):
-            continue
-        # Size of the lipid object (in pixels)
-        size_lipid = int(np.count_nonzero(cid_mask))
+    assigned_cids: Set[int] = set()
 
+    # Pass 1: multi-pair rule for merged AF objects
+    for aid, pairs in af_to_cids.items():
+        if not pairs:
+            continue
+        total_overlap = sum(ov for _, ov in pairs)
+        n_touching = len(pairs)
+        size_af = int(af_sizes[aid])
+        if (n_touching >= af_multi_min_count) or (size_af > 0 and (total_overlap / size_af) >= af_cover_frac):
+            # Assign all touching CARS objects as lipidated lipofuscin (no size gate)
+            for cid, _ in pairs:
+                if cid in assigned_cids:
+                    continue
+                labeled_lipo_lipid[cars_labels == cid] = next_lipo_lipid_id
+                next_lipo_lipid_id += 1
+                assigned_cids.add(cid)
+            consumed_af.add(aid)
+
+    # Pass 2: standard best-match with size-ratio gate for remaining CARS objects
+    for cid in range(1, max_cid + 1):
+        if cid in assigned_cids:
+            continue
+        cid_mask = (cars_labels == cid)
+        if not cid_mask.any():
+            continue
+        size_lipid = int(cars_sizes[cid])
         af_touch = af_labels[cid_mask]
         if af_touch.size == 0:
             labeled_pure_lipid[cid_mask] = next_pure_lipid_id
             next_pure_lipid_id += 1
             continue
-
-        counts = np.bincount(af_touch, minlength=int(af_labels.max()) + 1)
+        counts = np.bincount(af_touch, minlength=max_aid + 1)
         counts[0] = 0
-        best_af = int(np.argmax(counts))
-        best_overlap = int(counts[best_af])
-
-        # Additional size-ratio gate: AF size must be within [0.5x, 2.0x] of the lipid size
-        if best_af > 0 and best_overlap >= int(min_overlap):
-            size_af = int(np.count_nonzero(af_labels == best_af))
+        best_aid = int(np.argmax(counts))
+        best_overlap = int(counts[best_aid])
+        if best_aid > 0 and best_overlap >= int(min_overlap):
+            size_af = int(af_sizes[best_aid])
             if (size_af >= 0.5 * size_lipid) and (size_af <= 2.0 * size_lipid):
                 labeled_lipo_lipid[cid_mask] = next_lipo_lipid_id
                 next_lipo_lipid_id += 1
-                consumed_af.add(best_af)
+                consumed_af.add(best_aid)
             else:
-                # Size mismatch: treat as pure lipid; do NOT consume AF
                 labeled_pure_lipid[cid_mask] = next_pure_lipid_id
                 next_pure_lipid_id += 1
         else:
             labeled_pure_lipid[cid_mask] = next_pure_lipid_id
             next_pure_lipid_id += 1
 
-    max_aid = int(af_labels.max())
+    # Pass 3: any AF not consumed becomes pure lipofuscin
     for aid in range(1, max_aid + 1):
         if aid in consumed_af:
             continue
         aid_mask = (af_labels == aid)
-        if not np.any(aid_mask):
-            continue
-        labeled_pure_lipo[aid_mask] = next_pure_lipo_id
-        next_pure_lipo_id += 1
+        if aid_mask.any():
+            labeled_pure_lipo[aid_mask] = next_pure_lipo_id
+            next_pure_lipo_id += 1
 
     return labeled_pure_lipid, labeled_lipo_lipid, labeled_pure_lipo
 

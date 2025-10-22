@@ -33,14 +33,14 @@ import pandas as pd
 
 
 # ── USER SETTINGS ─────────────────────────────────────────────────────────────
-ROOT_DIR = Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025")
+ROOT_DIR = Path(r"D:\OneDrive - Stanford\Research Documents\AD Project\2025")
 OUTPUT_FILE = ROOT_DIR / "Myelin_TotalFits_AllSessions.xlsx"
 SHEET_FITS = "Myelin_TotalFits"
 SHEET_MEAN = "MeanSpectrum"
 SHEET_CLASS = "Myelin_Classification"
 
 # If classify_rules.py is NOT importable via PYTHONPATH, optionally point to it:
-CLASSIFY_RULES_PATH = Path(r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\lipid_analysis\classify_rules.py")
+CLASSIFY_RULES_PATH = Path(r"D:\OneDrive - Stanford\Research Documents\Python Scripts\lipid_analysis\classify_rules.py")
 
 # Provided x-axis (cm^-1). Length must match y_fit length (expected 32).
 X_CM1 = [

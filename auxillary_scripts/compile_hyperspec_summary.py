@@ -51,8 +51,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:  # no CLI args
         # EDIT THESE TWO LINES:
         sys.argv += [
-            "--data-root", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025",
-            "--out", r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025\Summary",
+            "--data-root", r"D:\OneDrive - Stanford\Research Documents\AD Project\2025",
+            "--out", r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\Summary",
             "--make-plots",           # uncomment if you want plots
             # "--dry-run",              # uncomment to preview files
         ]
