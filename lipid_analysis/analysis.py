@@ -575,7 +575,7 @@ def process_nd2_pair(
                     exclude_dark_regions=fluorescence_params.get("exclude_dark_regions", True),  # type: ignore[index]
                     dark_threshold=fluorescence_params.get("dark_threshold", 50),                # type: ignore[index]
                     min_hole_size=fluorescence_params.get("min_hole_size", 20_000),              # type: ignore[index]
-                    min_voxels_3d=None,  # set if you want strict 3-D cleanup
+                    min_voxels_3d=10000,  # set if you want strict 3-D cleanup
                     debug=False,
                     # NEW: optional bad-slice fallback knobs (all default to "off" if missing)
                     bad_slice_frac_threshold=fluorescence_params.get("bad_slice_frac_threshold"),

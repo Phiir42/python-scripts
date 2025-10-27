@@ -51,16 +51,16 @@ COLORS: Dict[str, str] = {
 }
 
 YLABELS: Dict[str, str] = {
-    "Lipids": "% lipid area/cell",
-    "Lipidated Lipofuscin": "% lipidated lipofuscin area/cell",
-    "Lipofuscin": "% lipofuscin area/cell",
+    "Lipids": "% lipid volume/cell",
+    "Lipidated Lipofuscin": "% lipidated lipofuscin \nvolume/cell",
+    "Lipofuscin": "% lipofuscin volume/cell",
 }
 
 # Per-category axis ranges and tick steps (adjust as needed)
 YLIMS: Dict[str, Tuple[float, float]] = {
-    "Lipids": (0.0, 5.0),
-    "Lipidated Lipofuscin": (0.0, 7.0),
-    "Lipofuscin": (0.0, 22.0),
+    "Lipids": (0.0, 3.0),
+    "Lipidated Lipofuscin": (0.0, 6.0),
+    "Lipofuscin": (0.0, 10.0),
 }
 YTICK_STEP: Dict[str, float] = {
     "Lipids": 1.0,
@@ -227,10 +227,16 @@ def plot_error_bands(
 
     # X axis
     ax.set_xticks(x)
-    ax.set_xticklabels(LAYERS_ORDER, rotation=45, ha="right", fontweight="bold")
+
+    # Show short labels while keeping parsing tied to LAYERS_ORDER
+    display_labels = ["I", "II", "III", "IV", "V", "VI", "WM"]
+    ax.set_xticklabels(display_labels, ha="right", fontweight="bold", fontsize=14)
+    
+    # Add an x-axis title at 18 pt (optional text you prefer)
+    ax.set_xlabel("Cortical Layer", fontweight="bold", fontsize=18)
 
     # Y axis
-    ax.set_ylabel(YLABELS.get(category, "Value"), fontweight="bold", fontsize=14)
+    ax.set_ylabel(YLABELS.get(category, "Value"), fontweight="bold", fontsize=18)
     ymin, ymax = YLIMS.get(category, (0.0, None))
     ax.set_ylim(bottom=ymin, top=ymax)
     step = YTICK_STEP.get(category, 1.0)
@@ -248,6 +254,7 @@ def plot_error_bands(
     ax.tick_params(
         axis="both", which="major", direction="out",
         length=10, width=TICK_W, color="black", pad=8,
+        labelsize=14, labelcolor="black",
     )
     for label in ax.get_yticklabels():
         label.set_fontweight("bold")
@@ -262,7 +269,7 @@ def plot_error_bands(
     os.makedirs(outdir, exist_ok=True)
     fname = f"{cell_type}_{category}_bands.png".replace(" ", "_")
     fpath = os.path.join(outdir, fname)
-    fig.savefig(fpath, dpi=DPI, transparent=True)
+    fig.savefig(fpath, dpi=DPI, transparent=True, bbox_inches="tight")
     plt.close(fig)
     return fpath
 

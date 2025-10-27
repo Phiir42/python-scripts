@@ -12,7 +12,9 @@ from skimage.measure import label
 from skimage.filters import (
     gaussian,
     threshold_li,
+    threshold_local,
     threshold_otsu,
+    threshold_sauvola,
     threshold_triangle,
     threshold_yen,
     sobel
@@ -103,7 +105,7 @@ def process_fluorescence_channel(
         valid_pixels = image_slice.ravel()
 
     thr_m = (threshold_method or "otsu").lower()
-    if valid_pixels.size > 0:
+    if valid_pixels.size > 0 and thr_m not in ("local", "sauvola"):
         if thr_m == "otsu":
             base_threshold = float(threshold_otsu(valid_pixels))
         elif thr_m == "li":
@@ -118,8 +120,48 @@ def process_fluorescence_channel(
     else:
         base_threshold = float("inf")
 
-    final_threshold = base_threshold * float(offset)
-    binary_mask = image_slice > final_threshold
+    # --- Apply either global or local threshold ---
+    thr_m = (threshold_method or "otsu").lower()
+    use_local = thr_m.startswith("local")  # "local" means adaptive local mean/gaussian
+    use_sauvola = (thr_m == "sauvola")
+
+    if use_sauvola:
+        block_size = max(51, int(2 * np.sqrt(max(cell_size, 1))))
+        if block_size % 2 == 0:
+            block_size += 1
+        # Map 'offset' to k (higher k => higher threshold => more conservative)
+        k = min(max(float(offset) * 0.25, 0.05), 0.8)  # e.g., offset=2 -> k=0.5
+        local_thresh = threshold_sauvola(image_slice, window_size=block_size, k=k)
+        binary_mask = image_slice > local_thresh
+    elif use_local:
+        # Make window scale with expected object size (odd number)
+        # Larger window => more conservative (less sensitive to tiny fluctuations).
+        block_size = int(2 * np.sqrt(cell_size))
+        if block_size % 2 == 0:
+            block_size += 1
+    
+        # Interpret 'offset' the same way as the global path:
+        # larger offset => *more conservative* (higher effective threshold).
+        # threshold_local uses (local_mean - offset), so to RAISE the threshold
+        # we must pass a NEGATIVE value.
+        if valid_pixels.size > 0:
+            p1, p99 = np.percentile(valid_pixels, [1, 99])
+            robust_scale = max((p99 - p1) / 16.0, 1.0)
+        else:
+            robust_scale = 10.0
+        
+        # Map user 'offset' to a negative bias so larger values are stricter.
+        # Example: offset=1.0 -> -1.0*scale (stricter than 0), offset=0.5 -> -0.5*scale (mild),
+        # offset=2.0 -> -2.0*scale (much stricter).
+        local_offset = -abs(float(offset)) * robust_scale
+        
+        local_thresh = threshold_local(image_slice, block_size, method="gaussian", offset=local_offset)
+        binary_mask = image_slice > local_thresh
+
+    else:
+        final_threshold = base_threshold * float(offset)
+        binary_mask = image_slice > final_threshold
+    
     binary_mask[exclude_mask] = False
 
     cleaned_mask = remove_small_objects(binary_mask, min_size=int(min_size))
@@ -130,13 +172,15 @@ def process_fluorescence_channel(
     cell_mask = remove_small_objects(binary_closed, min_size=int(cell_size))
 
     if debug:
-        import matplotlib.pyplot as plt  # local import to avoid hard dependency at import time
-
+        import matplotlib.pyplot as plt
         fig, axes = plt.subplots(1, 5, figsize=(20, 4))
         axes[0].imshow(image_slice, cmap="gray")
         axes[0].set_title("Raw Fluorescence")
+    
+        thr_label = (f"local (block={block_size}, off≈{local_offset:.1f})"
+                     if use_local else f"> {final_threshold:.2f}")
         axes[1].imshow(binary_mask, cmap="gray")
-        axes[1].set_title(f"Thresholded (> {final_threshold:.2f})")
+        axes[1].set_title(f"Thresholded ({thr_label})")
         axes[2].imshow(cleaned_mask, cmap="gray")
         axes[2].set_title("After First Cleaning")
         axes[3].imshow(binary_closed, cmap="gray")
