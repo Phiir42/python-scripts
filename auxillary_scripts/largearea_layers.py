@@ -35,6 +35,7 @@ import matplotlib.pyplot as plt
 from nd2reader import ND2Reader
 from skimage.measure import label, regionprops
 from skimage.exposure import rescale_intensity
+from skimage.filters import gaussian
 from skimage.io import imsave
 from skimage import morphology
 
@@ -52,10 +53,10 @@ logger.setLevel(logging.INFO)
 # User-editable constants
 # ----------------------------
 # Intensity cutoff (composite MIP) for tissue presence used everywhere
-TISSUE_INTENSITY_MIN: float = 20.0
+TISSUE_INTENSITY_MIN: float = 200.0
 
 # Cortical layer widths in microns: [L1, L2, L3, L4, L5, L6]
-LAYER_WIDTHS_UM: List[float] = [350, 350, 750, 350, 850, 750]
+LAYER_WIDTHS_UM: List[float] = [200, 350, 750, 350, 850, 750]
 
 # Filename token that identifies large-area scans
 LARGEAREA_TOKEN: str = "LargeArea"
@@ -100,13 +101,12 @@ PER_MARKER_SEG_KW: Dict[str, Dict[str, object]] = {
     "IBA1": {"threshold_method": "local", "offset": 0.5, "min_size": 150, "cell_size": 1600},
     "GFAP": {"threshold_method": "local", "offset": 0.5, "min_size": 150, "cell_size": 1600},
     "TUJ": {
-        "threshold_method": "sauvola",   # or "sauvola" (see note)
-        "offset": 0.28,                # smaller → less conservative in your mapping
-        "cell_size": 550,              # shrinks local window (~53 px) & final size gate
-        "min_size": 100,                # keep small islands before size gating
-        "closing_radius": 0,           # avoid fusing
-        "fill_holes": False,           # don’t convert rings to blobs
-        "exclude_dark_regions": False, # stop hard-masking dim tissue
+        "threshold_method": "local",
+        "offset": 0.14,        # ↓ less strict → recovers dim somata
+        "cell_size": 800,     # ↓ smaller window → more local contrast
+        "gaussian_sigma": 0.45, # less blurring, keeps soma rims
+        "closing_radius": 3,
+        "exclude_dark_regions": False,
     }
 }
 
@@ -176,37 +176,53 @@ def _debug_show_mips(sum_img: np.ndarray, imgs: Dict[str, np.ndarray],
     return saved_path
 
 
-def _debug_show_cellmask(marker: str, img: np.ndarray, mask: np.ndarray,
-                         save_dir: Optional[str] = None, show: bool = True) -> Optional[str]:
+def _save_fullres_overlay_rgba(
+    base_mip: np.ndarray, 
+    mask: np.ndarray, 
+    out_png: str, 
+    out_tif: Optional[str] = None, 
+    alpha: float = 0.5
+) -> None:
     """
-    Show and optionally save the threshold mask for each cell marker.
-    Displays the original channel MIP and its binary mask overlay.
+    Write a full-resolution overlay: the grayscale MIP under a partially
+    transparent RED mask. No matplotlib; saved at native array size.
     """
     from skimage.exposure import rescale_intensity
+    from skimage.io import imsave
+    import numpy as np
 
-    disp = rescale_intensity(img, in_range="image", out_range=(0.0, 1.0))
-    overlay = np.dstack([disp, disp, disp])
-    overlay[..., 1] += mask.astype(np.float32) * 0.7  # green overlay for mask
-    overlay = np.clip(overlay, 0, 1)
+    # 1) Display-scale the MIP to [0, 255] uint8 (ImageJ-friendly)
+    disp = rescale_intensity(base_mip, in_range="image", out_range=(0.0, 1.0)).astype(np.float32)
+    base = (np.clip(disp, 0, 1) * 255.0).astype(np.uint8)
+    if base.ndim != 2:
+        raise ValueError(f"Expected a 2-D MIP for overlay, got shape {base.shape}")
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
-    axs[0].imshow(disp, cmap="gray")
-    axs[0].set_title(f"{marker}: raw MIP")
-    axs[0].axis("off")
-    axs[1].imshow(overlay)
-    axs[1].set_title(f"{marker}: mask overlay")
-    axs[1].axis("off")
-    plt.tight_layout()
+    H, W = base.shape
+    rgb = np.stack([base, base, base], axis=-1)  # (H,W,3) uint8
 
-    saved_path = None
-    if save_dir is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        saved_path = os.path.join(save_dir, f"debug_mask_{marker}.png")
-        fig.savefig(saved_path, dpi=160)
-    if show:
-        plt.show()
-    plt.close(fig)
-    return saved_path
+    # 2) Alpha-blend a red layer where mask==True
+    m = mask.astype(bool, copy=False)
+    if m.shape != base.shape:
+        raise ValueError(f"Mask shape {m.shape} != MIP shape {base.shape}")
+    a = float(np.clip(alpha, 0.0, 1.0))
+
+    # Existing pixel values as float32 for blending
+    rf = rgb.astype(np.float32, copy=True)
+    # Blend toward pure red [255,0,0] where mask==1:  new = (1-a)*base + a*target
+    rf[m, 0] = (1.0 - a) * rf[m, 0] + a * 255.0  # R
+    rf[m, 1] = (1.0 - a) * rf[m, 1] + a * 0.0    # G
+    rf[m, 2] = (1.0 - a) * rf[m, 2] + a * 0.0    # B
+    over_rgb = np.clip(rf, 0, 255).astype(np.uint8)
+
+    # 3) Save full-res PNG (lossless) and optional TIFF
+    imsave(out_png, over_rgb, check_contrast=False)
+    if out_tif is not None:
+        try:
+            from tifffile import imwrite as _tifwrite
+            _tifwrite(out_tif, over_rgb, photometric="rgb")
+        except Exception:
+            # Fallback: also write PNG if TIFF writer missing
+            imsave(out_tif, over_rgb, check_contrast=False)
 
 
 def find_largearea_nd2s(data_dir: str) -> List[str]:
@@ -259,6 +275,7 @@ def _build_tissue_mask(sum_image: np.ndarray, _segkw: Dict[str, object]) -> np.n
     arr = sum_image.astype(np.float32)
     # treat NaNs as background for the purpose of 'is tissue?'
     arr = np.nan_to_num(arr, nan=0.0)
+    arr = gaussian(arr, sigma=2.0, preserve_range=True)
 
     mask = (arr >= TISSUE_INTENSITY_MIN)
 
@@ -425,14 +442,14 @@ def _save_debug_overlays(
         comp_disp = rescale(comp, scale, channel_axis=2, anti_aliasing=True, preserve_range=True).astype(np.float32)
         tm_disp = rescale(tissue_mask.astype(np.float32), scale, anti_aliasing=False, preserve_range=True) > 0.5
         H, W = tm_disp.shape
+    # IMPORTANT: scale layer offsets to match the downscaled display geometry
+    start_px_disp = float(axis.start_px) * float(scale)
+    px_um_disp = float(px_um) / float(scale)  # µm/px on the display canvas
 
-    # Figure 1: tissue + superficial arrow
+    # Figure 1: B/W tissue mask only (no composite), with superficial arrow
     fig1, ax1 = plt.subplots(figsize=(10, 8))
-    ax1.imshow(comp_disp)
-    tm = tm_disp.astype(np.float32)
-    tm3 = np.dstack([tm, np.zeros_like(tm), np.zeros_like(tm)])
-    ax1.imshow(tm3, alpha=0.25)
-    ax1.set_title(f"Tissue mask & superficial edge: {axis.side}")
+    ax1.imshow(tm_disp, cmap="gray", vmin=0, vmax=1)
+    ax1.set_title(f"Tissue mask (threshold ≥ {int(TISSUE_INTENSITY_MIN)}) — superficial: {axis.side}")
     # draw arrow along the superficial edge pointing inward
     if axis.side == "top":
         ax1.arrow(W*0.5, 10, 0, H*0.1, color="yellow", width=2, head_width=40, length_includes_head=True)
@@ -452,19 +469,21 @@ def _save_debug_overlays(
     ax2.imshow(comp_disp)
     # rows/cols computations keep using H, W from above (already rescaled if needed)
     cum = np.cumsum(np.asarray(layer_widths_um, dtype=float))
-    lines_px = (cum / max(px_um, 1e-9)) + float(axis.start_px)
+    # convert layer cumulative depths (µm) to display pixels and add scaled start offset
+    lines_px_disp = (cum / max(px_um_disp, 1e-9)) + start_px_disp
     if axis.side in ("top", "bottom"):
-        # horizontal lines (use downscaled H)
-        rows = lines_px if axis.side == "top" else (H - lines_px)
+        # horizontal lines
+        rows = lines_px_disp if axis.side == "top" else (H - lines_px_disp)
         for r in rows:
             rr = float(np.clip(r, 0, H-1))
             ax2.plot([0, W-1], [rr, rr], linestyle="--", linewidth=2)
     else:
-        # vertical lines (use downscaled W)
-        cols = lines_px if axis.side == "left" else (W - lines_px)
+        # vertical lines
+        cols = lines_px_disp if axis.side == "left" else (W - lines_px_disp)
         for c in cols:
             cc = float(np.clip(c, 0, W-1))
             ax2.plot([cc, cc], [0, H-1], linestyle="--", linewidth=2)
+
     ax2.set_title("Layer boundaries (dashed)")
     ax2.axis("off")
     p2 = os.path.join(out_dir, f"{file_stub}_overlay_layers.png")
@@ -535,9 +554,39 @@ def analyze_largearea_nd2(nd2_path: str, config: dict) -> Tuple[pd.DataFrame, pd
                 sum_img[nan_locs] = cur[nan_locs]
     sum_img = np.nan_to_num(sum_img, nan=0.0)
     
-    # DEBUG: visualize & save the exact inputs to masking
+    # -- SAVE the composite MIP used for tissue mask so we can inspect it in ImageJ --
+    from tifffile import imwrite
+    
     out_img_dir = ensure_subdirectory(os.path.dirname(nd2_path), "LargeArea/Images")
     stub = os.path.splitext(os.path.basename(nd2_path))[0]
+    
+    # 1) Raw float32 (no scaling)
+    raw_tif = os.path.join(out_img_dir, f"{stub}_compositeMIP_raw32.tif")
+    imwrite(raw_tif, sum_img.astype(np.float32))
+    
+    # 2) Percentile-scaled to uint16 (easy to view)
+    finite = np.isfinite(sum_img)
+    p1, p999 = (np.percentile(sum_img[finite], [1.0, 99.9]) if finite.any() else (0.0, 1.0))
+    den = max(p999 - p1, 1e-6)
+    scaled16 = np.clip((sum_img - p1) / den, 0, 1)
+    scaled_tif = os.path.join(out_img_dir, f"{stub}_compositeMIP_scaled16.tif")
+    imwrite(scaled_tif, (scaled16 * 65535).astype(np.uint16))
+    
+    # 3) “<20 set to zero” diagnostic (same percentile scaling for display)
+    thr20 = sum_img.copy()
+    thr20[~finite] = 0.0
+    thr20[thr20 < TISSUE_INTENSITY_MIN] = 0.0
+    thr20_disp = np.clip((thr20 - p1) / den, 0, 1)
+    thr20_tif = os.path.join(out_img_dir, f"{stub}_compositeMIP_thr20zero16.tif")
+    imwrite(thr20_tif, (thr20_disp * 65535).astype(np.uint16))
+    
+    # Helpful logging
+    logger.info("[MIP] Saved composite MIPs: raw32=%s | scaled16=%s | thr20zero16=%s | p1=%.2f p99.9=%.2f",
+                raw_tif, scaled_tif, thr20_tif, p1, p999)
+    
+    # keep a light reference for composite overlays later
+    imgs_for_comp = dict(imgs)
+
     _debug_show_mips(sum_img, imgs, title_stub=stub, save_dir=out_img_dir, show=False)
 
     tissue_mask = _build_tissue_mask(sum_img, base_segkw)
@@ -569,9 +618,11 @@ def analyze_largearea_nd2(nd2_path: str, config: dict) -> Tuple[pd.DataFrame, pd
         cell_mask = _segment_cells_2d(img, mk_segkw)
         mask_path = os.path.join(out_img_dir, f"{stub}_{marker}_mask.png")
         imsave(mask_path, (cell_mask.astype(np.uint16) * 65535), check_contrast=False)
-    
-        # --- Debug overlay for quick visual inspection ---
-        _debug_show_cellmask(marker, img, cell_mask, save_dir=out_img_dir, show=False)
+        
+        # --- NEW: save full-res alpha overlay (red) on top of the MIP ---
+        overlay_png = os.path.join(out_img_dir, f"{stub}_{marker}_overlay.png")
+        overlay_tif = os.path.join(out_img_dir, f"{stub}_{marker}_overlay.tif")
+        _save_fullres_overlay_rgba(disp, cell_mask, overlay_png, out_tif=overlay_tif, alpha=0.5)
     
         # --- Apply tissue mask before downstream counting ---
         cell_mask &= tissue_mask
@@ -647,8 +698,10 @@ def analyze_largearea_nd2(nd2_path: str, config: dict) -> Tuple[pd.DataFrame, pd
             gray = rescale_intensity(sum_img, in_range="image", out_range=(0.0, 1.0)).astype(np.float32)
             composite = np.dstack([gray, gray, gray])
         else:
-            composite = composite_fluorescence(imgs, config)  # float RGB in [0,1]
-    except Exception:
+            # Use cached copy even if imgs was partially freed
+            composite = composite_fluorescence(imgs_for_comp, config)  # float RGB in [0, 1]
+    except Exception as exc:
+        logger.warning("[LargeArea] Composite RGB fallback due to %s", exc)
         gray = rescale_intensity(sum_img, in_range="image", out_range=(0.0, 1.0)).astype(np.float32)
         composite = np.dstack([gray, gray, gray])
 
@@ -739,14 +792,29 @@ def run_batch(
 
 
 if __name__ == "__main__":
-    # Edit these defaults in Spyder for quick testing
-    CONFIG_PY = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3d.py"
-    DATA_DIR = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD3d"
-
     import sys
+
+    # Local defaults for manual/Spyder runs (safe fallback)
+    DEFAULT_CONFIG_PY = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3d.py"
+    DEFAULT_DATA_DIR  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD3d"
+
+    # Prefer CLI args passed by the batch driver:  sys.argv[1]=config, sys.argv[2]=data_dir
+    if len(sys.argv) >= 3:
+        config_py = sys.argv[1]
+        data_dir  = sys.argv[2]
+    else:
+        print("[LargeArea] No CLI args detected; using local defaults.")
+        config_py = DEFAULT_CONFIG_PY
+        data_dir  = DEFAULT_DATA_DIR
+
     try:
-        out_path, n_ok, n_fail = run_batch(CONFIG_PY, DATA_DIR, out_name="LargeArea_Counts.xlsx")
+        # Use folder name in the output filename when running via CLI; plain name on manual runs.
+        base = os.path.basename(os.path.normpath(data_dir))
+        outname = f"LargeArea_Counts_{base}.xlsx" if len(sys.argv) >= 3 else "LargeArea_Counts.xlsx"
+
+        out_path, n_ok, n_fail = run_batch(config_py, data_dir, out_name=outname)
         print(f"[LargeArea] Done → {out_path} (ok={n_ok}, fail={n_fail})")
+
         # Exit codes: 0=success, 2=partial failure, 1=all failed
         if n_ok == 0:
             sys.exit(1)

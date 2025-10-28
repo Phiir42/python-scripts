@@ -3,9 +3,23 @@ import os
 import re
 import subprocess, sys
 
+# Ensure subprocesses can import largearea_layers and lipid_analysis
+THIS_DIR = os.path.abspath(os.path.dirname(__file__))
+SCRIPTS_ROOT = os.path.abspath(os.path.join(THIS_DIR, ".."))
+
+# Prefer importing to discover the exact file location; fall back to join if import fails.
+try:
+    # Ensure the parent “Python Scripts” is importable in this parent process
+    if SCRIPTS_ROOT not in sys.path:
+        sys.path.insert(0, SCRIPTS_ROOT)
+    import largearea_layers as _lal
+    LAL_SCRIPT = os.path.abspath(_lal.__file__)
+except Exception:
+    LAL_SCRIPT = os.path.join(SCRIPTS_ROOT, "largearea_layers.py")
+
 # ---- USER SETTINGS ---------------------------------------------------------
-DATA_ROOT = r"C:\Users\clchr\OneDrive - Stanford\Research Documents\AD Project\2025"
-CONFIG_DIR = r"C:\Users\clchr\OneDrive - Stanford\Research Documents\Python Scripts\config_files"
+DATA_ROOT = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025"
+CONFIG_DIR = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files"
 
 # 1) Which dataset folders to process (recursive match)
 FOLDER_PATTERN = re.compile(r"^AD[34][d-f]$", re.IGNORECASE)   # AD3d–f, AD4d–f
@@ -65,10 +79,19 @@ def run_on_regex_sets(data_root: str) -> None:
             continue
 
         print(f"▶ Processing {base} in isolated subprocess")
-        cmd = [sys.executable, "-m", "largearea_layers", cfg, dirpath]
+        print(f"  ↳ cfg={cfg}")
 
-        # Capture output so we can show clear status lines
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        # Run the script by absolute path (robust even under Spyder/Anaconda)
+        cmd = [sys.executable, LAL_SCRIPT, cfg, dirpath]
+        
+        lal_dir = os.path.dirname(LAL_SCRIPT)
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=lal_dir  # execute from the folder that actually contains largearea_layers.py
+        )
 
         # Echo the child stdout/stderr (so you keep the detailed per-ND2 logs)
         if result.stdout:
@@ -78,16 +101,54 @@ def run_on_regex_sets(data_root: str) -> None:
             print(result.stderr, end="")
 
         rc = result.returncode
-        if rc == 0:
-            print(f"✓ Done: {base}")
-            processed.append((base, "ok"))
-        elif rc == 2:
-            print(f"❗ Partial failure in {base} (some ND2s failed)")
-            any_fail = True
-            partials.append(base)
-            processed.append((base, "partial"))
+        # Prefer reading the child’s _STATUS.txt if present
+        status_txt = os.path.join(dirpath, "LargeArea", "_STATUS.txt")
+        if os.path.isfile(status_txt):
+            try:
+                with open(status_txt, "r", encoding="utf-8") as fh:
+                    txt = fh.read()
+                # Parse counts from the status file
+                # Expected line: "Succeeded: X | Failed: Y | Total: Z"
+                import re as _re
+                m = _re.search(r"Succeeded:\s*(\d+)\s*\|\s*Failed:\s*(\d+)\s*\|\s*Total:\s*(\d+)", txt)
+                if m:
+                    ok = int(m.group(1)); fail = int(m.group(2))
+                    if ok > 0 and fail == 0:
+                        print(f"✓ Done: {base}")
+                        processed.append((base, "ok"))
+                    elif ok > 0 and fail > 0:
+                        print(f"❗ Partial failure in {base} (some ND2s failed)")
+                        any_fail = True
+                        partials.append(base)
+                        processed.append((base, "partial"))
+                    else:
+                        print(f"❌ {base} failed (no ND2s succeeded)")
+                        any_fail = True
+                        hardfails.append(base)
+                        processed.append((base, "fail"))
+                else:
+                    # Couldn’t parse: fall back to rc
+                    if rc == 0:
+                        print(f"✓ Done: {base}")
+                        processed.append((base, "ok"))
+                    else:
+                        print(f"❌ {base} failed (exit code {rc})")
+                        any_fail = True
+                        hardfails.append(base)
+                        processed.append((base, "fail"))
+            except Exception:
+                # Read/parsing failed — fall back to rc
+                if rc == 0:
+                    print(f"✓ Done: {base}")
+                    processed.append((base, "ok"))
+                else:
+                    print(f"❌ {base} failed (exit code {rc})")
+                    any_fail = True
+                    hardfails.append(base)
+                    processed.append((base, "fail"))
         else:
-            print(f"❌ {base} failed (exit code {rc})")
+            # No status file — this is a hard fail regardless of rc (script likely didn’t run)
+            print(f"❌ {base} failed before status was written (exit code {rc})")
             any_fail = True
             hardfails.append(base)
             processed.append((base, "fail"))

@@ -126,13 +126,23 @@ def process_fluorescence_channel(
     use_sauvola = (thr_m == "sauvola")
 
     if use_sauvola:
-        block_size = max(51, int(2 * np.sqrt(max(cell_size, 1))))
+        # Slightly larger window; helps avoid local noise gluing neurites together
+        block_size = max(75, int(2.5 * np.sqrt(max(cell_size, 1))))
         if block_size % 2 == 0:
             block_size += 1
-        # Map 'offset' to k (higher k => higher threshold => more conservative)
-        k = min(max(float(offset) * 0.25, 0.05), 0.8)  # e.g., offset=2 -> k=0.5
-        local_thresh = threshold_sauvola(image_slice, window_size=block_size, k=k)
-        binary_mask = image_slice > local_thresh
+    
+        # Robust normalize to [0,1] so Sauvola's k, R behave consistently
+        v = image_slice.astype(np.float32, copy=False)
+        p1, p99 = np.percentile(v[~np.isnan(v)], [1, 99]) if v.size else (0.0, 1.0)
+        denom = max(p99 - p1, 1e-6)
+        v_norm = np.clip((v - p1) / denom, 0.0, 1.0)
+    
+        k = float(np.clip(offset, 0.05, 0.8))
+        # Modestly smaller r makes the threshold less permissive
+        local_thresh = threshold_sauvola(v_norm, window_size=block_size, k=k, r=0.35)
+    
+        # Compare in the normalized domain, then bring mask back
+        binary_mask = v_norm > local_thresh
     elif use_local:
         # Make window scale with expected object size (odd number)
         # Larger window => more conservative (less sensitive to tiny fluctuations).
@@ -176,9 +186,12 @@ def process_fluorescence_channel(
         fig, axes = plt.subplots(1, 5, figsize=(20, 4))
         axes[0].imshow(image_slice, cmap="gray")
         axes[0].set_title("Raw Fluorescence")
-    
-        thr_label = (f"local (block={block_size}, off≈{local_offset:.1f})"
-                     if use_local else f"> {final_threshold:.2f}")
+        if use_sauvola:
+            thr_label = f"sauvola (k={k:.2f}, block={block_size})"
+        elif use_local:
+            thr_label = f"local (block={block_size}, off≈{local_offset:.2f})"
+        else:
+            thr_label = f"> {final_threshold:.2f}"
         axes[1].imshow(binary_mask, cmap="gray")
         axes[1].set_title(f"Thresholded ({thr_label})")
         axes[2].imshow(cleaned_mask, cmap="gray")
