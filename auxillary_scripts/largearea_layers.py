@@ -58,6 +58,17 @@ TISSUE_INTENSITY_MIN: float = 200.0
 # Cortical layer widths in microns: [L1, L2, L3, L4, L5, L6]
 LAYER_WIDTHS_UM: List[float] = [200, 350, 750, 350, 850, 750]
 
+# Layer-specific TUJ segmentation overrides (keys: 1..6 for L1..L6)
+# These override DEFAULT_SEGMENT_KW ⟶ PER_MARKER_SEG_KW("TUJ") ⟶ per-layer below.
+# Tune just L1–L4 where superficial overmerge occurs.
+LAYER_SEGMENT_OVERRIDES_TUJ: Dict[int, Dict[str, object]] = {
+    1: dict(offset=0.55, closing_radius=1, gaussian_sigma=0.40, fill_holes=False, min_size=180),
+    2: dict(offset=0.55, closing_radius=1, gaussian_sigma=0.40, fill_holes=False, min_size=180),
+    3: dict(offset=0.45, closing_radius=1, gaussian_sigma=0.45, fill_holes=False, min_size=180),
+    4: dict(offset=0.35, closing_radius=2, gaussian_sigma=0.45, fill_holes=False, min_size=170),
+    5: dict(offset=0.25, closing_radius=2, gaussian_sigma=0.45, fill_holes=False, min_size=170),
+}
+
 # Filename token that identifies large-area scans
 LARGEAREA_TOKEN: str = "LargeArea"
 
@@ -68,7 +79,7 @@ DEFAULT_SEGMENT_KW: Dict[str, float | int | bool | str] = dict(
     closing_radius=5,
     gaussian_sigma=1.0,
     fill_holes=True,
-    threshold_method="Local",
+    threshold_method="local",
     offset=0.5,
     exclude_dark_regions=True,
     dark_threshold=40,
@@ -411,6 +422,11 @@ def _assign_layers_by_centroid(mask: np.ndarray, depth_um: np.ndarray, layer_wid
     return pd.Series(lyr_out, name="Layer"), pd.Series(reg_out, name="Region")
 
 
+def _layer_index_map(depth_um: np.ndarray, layer_widths_um: List[float]) -> np.ndarray:
+    boundaries = np.cumsum(np.asarray(layer_widths_um, dtype=float))
+    return (np.searchsorted(boundaries, depth_um, side="right") + 1).astype(np.int16, copy=False)
+
+
 def _save_debug_overlays(
     out_dir: str,
     file_stub: str,
@@ -592,6 +608,9 @@ def analyze_largearea_nd2(nd2_path: str, config: dict) -> Tuple[pd.DataFrame, pd
     tissue_mask = _build_tissue_mask(sum_img, base_segkw)
     axis = _infer_superficial_axis(sum_img)
     depth_um = np.clip(axis.depth_px - axis.start_px, 0, None) * float(px_um)
+    
+    # Per-pixel layer indices 1..6, 7=WM
+    layer_idx_map = _layer_index_map(depth_um, LAYER_WIDTHS_UM)
 
     # Per-marker segmentation & object extraction restricted to tissue
     rows: List[dict] = []
@@ -613,9 +632,47 @@ def analyze_largearea_nd2(nd2_path: str, config: dict) -> Tuple[pd.DataFrame, pd
     
         # --- Build per-marker seg kwargs (base + specific overrides) ---
         mk_segkw = dict(base_segkw, **PER_MARKER_SEG_KW.get(marker, {}))
-    
-        # --- Segment and save mask ---
-        cell_mask = _segment_cells_2d(img, mk_segkw)
+        
+        # --- TUJ-only: layer-specific segmentation to prevent superficial overmerge ---
+        if str(marker).strip().upper() == "TUJ":
+            H, W = img.shape
+            union_mask = np.zeros((H, W), dtype=bool)
+        
+            # Dynamically handle whatever layers have overrides (e.g., 1..4, or 1..5)
+            override_layers = sorted(int(k) for k in LAYER_SEGMENT_OVERRIDES_TUJ.keys())
+            handled = np.zeros((H, W), dtype=bool)
+        
+            for lyr in override_layers:
+                m = (layer_idx_map == lyr)
+                if tissue_mask is not None:
+                    m &= tissue_mask
+                if not m.any():
+                    continue
+        
+                # TUJ defaults + per-layer override
+                segkw_layer = dict(mk_segkw)
+                segkw_layer.update(LAYER_SEGMENT_OVERRIDES_TUJ.get(lyr, {}))
+        
+                # Log and segment full frame (stable local neighborhoods), then clamp to layer
+                logger.info("[TUJ] Layer %d overrides: %s", lyr,
+                            {k: segkw_layer[k] for k in ("offset","closing_radius","gaussian_sigma","fill_holes","min_size")
+                             if k in segkw_layer})
+        
+                mask_layer = _segment_cells_2d(img, segkw_layer) & m
+                union_mask |= mask_layer
+                handled |= m
+        
+            # Fallback: any tissue pixels in layers NOT overridden use default TUJ params
+            m_fallback = tissue_mask & (~handled) if tissue_mask is not None else (~handled)
+            if m_fallback.any():
+                mask_fb = _segment_cells_2d(img, mk_segkw) & m_fallback
+                union_mask |= mask_fb
+        
+            cell_mask = union_mask
+        else:
+            # Non-TUJ markers: original path
+            cell_mask = _segment_cells_2d(img, mk_segkw)
+
         mask_path = os.path.join(out_img_dir, f"{stub}_{marker}_mask.png")
         imsave(mask_path, (cell_mask.astype(np.uint16) * 65535), check_contrast=False)
         
@@ -795,8 +852,8 @@ if __name__ == "__main__":
     import sys
 
     # Local defaults for manual/Spyder runs (safe fallback)
-    DEFAULT_CONFIG_PY = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD3d.py"
-    DEFAULT_DATA_DIR  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD3d"
+    DEFAULT_CONFIG_PY = r"D:\OneDrive - Stanford\Research Documents\Python Scripts\config_files\config_AD4e.py"
+    DEFAULT_DATA_DIR  = r"D:\OneDrive - Stanford\Research Documents\AD Project\2025\AD4e"
 
     # Prefer CLI args passed by the batch driver:  sys.argv[1]=config, sys.argv[2]=data_dir
     if len(sys.argv) >= 3:

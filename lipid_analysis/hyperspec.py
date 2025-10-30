@@ -30,7 +30,6 @@ logger.setLevel(LOG_LEVEL)
 # e.g. in cli.py:  import lipid_analysis.hyperspec as hyperspec; hyperspec.config = config
 config: Optional[Dict[str, Any]] = None
 
-
 # --- Glitch repair helpers ----------------------------------------------------
 def _repair_zero_glitches(
     y: np.ndarray, z_abs: float = 1e-9, z_rel: float = 0.02, win: int = 3
@@ -198,9 +197,10 @@ def _save_labeled_mask_images(
     labeled_mask: np.ndarray, base_gray: np.ndarray, out_dir: str
 ) -> tuple[Optional[str], Optional[str]]:
     """
-    Save two PNGs into `out_dir`:
-      (1) a color-by-label image with numeric IDs drawn at region centroids
-      (2) an overlay of the labels on a grayscale background image
+    Save three images into `out_dir`:
+      (1) Hyperspec_LabeledObjects.png — color-by-label with numeric IDs
+      (2) Hyperspec_LabeledObjects_overlay.png — IDs over high-contrast CARS
+      (3) Hyperspec_LabeledObjects_overlay_noIDs.png — same overlay without IDs
     """
     import matplotlib
     import matplotlib.colors as mcolors
@@ -211,7 +211,7 @@ def _save_labeled_mask_images(
     if n == 0:
         return None, None
 
-    # Label color image
+    # ---- color-by-label base (no numbers yet) ----
     rgb = np.zeros((H, W, 3), dtype=np.uint8)
     nz = labeled_mask > 0
     norm = mcolors.Normalize(vmin=1, vmax=n)
@@ -222,8 +222,8 @@ def _save_labeled_mask_images(
     borders = find_boundaries(labeled_mask, mode="outer")
     rgb[borders] = [255, 255, 255]
 
-    # Draw numeric IDs
-    img_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    # ---- write color-by-label WITH numbers ----
+    img_with_ids_bgr = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
     font = cv2.FONT_HERSHEY_SIMPLEX
     for r in measure.regionprops(labeled_mask):
         y, x = (int(round(r.centroid[0])), int(round(r.centroid[1])))
@@ -231,20 +231,47 @@ def _save_labeled_mask_images(
         (tw, th), _ = cv2.getTextSize(txt, font, 0.5, 1)
         x0, y0 = max(0, x - 1), max(0, y - th - 2)
         x1, y1 = min(W - 1, x + tw + 1), min(H - 1, y + 2)
-        cv2.rectangle(img_bgr, (x0, y0), (x1, y1), (0, 0, 0), -1)
-        cv2.putText(img_bgr, txt, (x, y), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.rectangle(img_with_ids_bgr, (x0, y0), (x1, y1), (0, 0, 0), -1)
+        cv2.putText(img_with_ids_bgr, txt, (x, y), font, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     out_path_mask = os.path.join(out_dir, "Hyperspec_LabeledObjects.png")
-    cv2.imwrite(out_path_mask, img_bgr)
+    cv2.imwrite(out_path_mask, img_with_ids_bgr)
 
-    # Overlay on grayscale context
+    # ---- high-contrast CARS using CLAHE ----
     base = base_gray.astype(np.float32)
     bmax = base.max() if base.max() > 0 else 1.0
     base8 = (base / bmax * 255).astype(np.uint8)
-    base_rgb = cv2.cvtColor(base8, cv2.COLOR_GRAY2BGR)
-    overlay = cv2.addWeighted(base_rgb, 0.6, img_bgr, 0.8, 0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    base8_eq = clahe.apply(base8)
+    base_rgb = cv2.cvtColor(base8_eq, cv2.COLOR_GRAY2BGR)
+
+    # overlays: (a) WITH numbers, (b) NO numbers
+    overlay_with_ids = cv2.addWeighted(base_rgb, 0.65, img_with_ids_bgr, 0.80, 0)
+
+    img_no_ids_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    overlay_no_ids  = cv2.addWeighted(base_rgb, 0.65, img_no_ids_bgr, 0.80, 0)
+
     out_path_overlay = os.path.join(out_dir, "Hyperspec_LabeledObjects_overlay.png")
-    cv2.imwrite(out_path_overlay, overlay)
+    out_path_overlay_noids = os.path.join(out_dir, "Hyperspec_LabeledObjects_overlay_noIDs.png")
+    cv2.imwrite(out_path_overlay, overlay_with_ids)
+    cv2.imwrite(out_path_overlay_noids, overlay_no_ids)
+    
+    # --- optional: 2-channel TIFF for FIJI (Ch 0 = CARS, Ch 1 = labels) ---
+    try:
+        import tifffile as tiff
+        cars16 = (base / bmax * 65535.0).astype(np.uint16)          # full-range 16-bit CARS
+        labels16 = labeled_mask.astype(np.uint16)                   # label IDs (0=background)
+        # Stack as (channels, height, width) so FIJI sees 2 channels
+        tiff_path = os.path.join(out_dir, "Hyperspec_CARS_and_Labels.tif")
+        tiff.imwrite(
+            tiff_path,
+            np.stack([cars16, labels16], axis=-1),
+            photometric="minisblack",
+            metadata={"axes": "YXC"}  # Channels, Y, X
+        )
+    except Exception as _exc:
+        logger.info("TIFF (2-channel) write skipped: %s", _exc)
+
     return out_path_mask, out_path_overlay
 
 
@@ -552,7 +579,21 @@ def infer_hyperspectral_mapping(spectrum_folder: str, cfg: Dict[str, Any]) -> Di
         chosen_marker = marker_priority[0]
     chosen_marker = resolve_marker_name(chosen_marker, cfg)
 
-    return {"cars_nd2": cars_name, "fluor_nd2": fluor_name, "cell_marker": chosen_marker}
+    # If this hyperspectral folder is a neuron series, also return all CARS stack candidates
+    # so the caller can evaluate alignment on each and keep the best.
+    if "neuronspectrum" in name_l:
+        cars_list = [nm for (nm, _meta) in cars_candidates]
+        if len(cars_list) > 1:
+            # non-breaking extra key; downstream can ignore if not present
+            extra = {"cars_nd2_candidates": cars_list}
+        else:
+            extra = {}
+    else:
+        extra = {}
+
+    ret = {"cars_nd2": cars_name, "fluor_nd2": fluor_name, "cell_marker": chosen_marker}
+    ret.update(extra)
+    return ret
 
 
 def compute_myelin_average_for_series(
@@ -729,9 +770,32 @@ def process_hyperspectral_series(
         logger.info("[HYPERMAP] Using config mapping: %s", mapping)
 
     data_dir = config["paths"]["data_directory"]
-    cars_nd2_path = os.path.join(data_dir, mapping["cars_nd2"])
-    fluor_nd2_path = os.path.join(data_dir, mapping["fluor_nd2"])
     cell_marker = mapping["cell_marker"]
+
+    # ---- NEW: Build candidate pools (handles AD4b having two StacksNeurons) ----
+    from .filepairing import parse_nd2_filename
+
+    # Gather *all* ND2s in data_dir that share the same stacks label as mapping,
+    # and split into CARS vs fluorescence candidates.
+    target_stacks_label = parse_nd2_filename(mapping["cars_nd2"], config)["stacks_label"]
+    cars_pool = []
+    fluor_pool = []
+    for item in os.listdir(data_dir):
+        if not item.lower().endswith(".nd2"):
+            continue
+        meta = parse_nd2_filename(item, config)
+        if meta["stacks_label"] != target_stacks_label:
+            continue
+        fullp = os.path.join(data_dir, item)
+        if meta["contains_cars"]:
+            cars_pool.append((item, meta, fullp))
+        else:
+            fluor_pool.append((item, meta, fullp))
+
+    if not cars_pool:
+        raise FileNotFoundError(f"No CARS candidates found for stacks '{target_stacks_label}' in {data_dir}")
+    if not fluor_pool:
+        raise FileNotFoundError(f"No fluorescence candidates found for stacks '{target_stacks_label}' in {data_dir}")
 
     # --- Load and correct the 32-image hyperspectral series ---
     def _num_key(p: str) -> int | str:
@@ -756,35 +820,71 @@ def process_hyperspectral_series(
 
     mask_image = corrected_images[8]  # 9th image (index 8) used for droplet mask
 
-    # --- Align to best position in the CARS ND2 via Pearson r ---
-    with ND2Reader(cars_nd2_path) as cars_nd2:
-        total_v = cars_nd2.sizes.get("v", 1)
-        best_v, best_r = None, -np.inf
+    # --- Align to best position across ALL CARS candidates via Pearson r ---
+    def _pearson_best_v(cars_path: str, ref_img: np.ndarray) -> tuple[int, float, np.ndarray]:
+        from skimage.filters import gaussian
+        with ND2Reader(cars_path) as nd2:
+            total_v = nd2.sizes.get("v", 1)
+            H = ref_img.astype(np.float32)
+            Hm, Hs = H.mean(), H.std()
+            best_v_local, best_r_local, best_mip = 0, -np.inf, None
+            for v_idx in range(total_v):
+                mip_slices = []
+                for z in range(nd2.sizes.get("z", 1)):
+                    raw_sl = np.nan_to_num(nd2.get_frame_2D(v=v_idx, c=CARS_CH, z=z)).astype(np.float32)
+                    filtered = apply_east_shadows_filter(raw_sl)
+                    den = np.clip(reference_image, 1e-6, None)
+                    corrected = filtered / den
+                    if foci_params.get("sigma", 0) > 0:
+                        corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
+                    mip_slices.append(corrected)
+                C = np.max(np.stack(mip_slices, axis=0), axis=0)
+                Cm, Cs = C.mean(), C.std()
+                r = -np.inf if (Hs == 0 or Cs == 0) else float(((H - Hm) * (C - Cm)).sum() / (Hs * Cs * H.size))
+                if r > best_r_local:
+                    best_r_local, best_v_local, best_mip = r, v_idx, C
+        return best_v_local, best_r_local, best_mip
 
-        H = mask_image.astype(np.float32)
-        Hm, Hs = H.mean(), H.std()
+    # Score *each* CARS candidate using the already-built mask_image (9th corrected frame)
+    best_tuple = (-np.inf, None, None, None)  # (r, v, path, mip_best)
+    for name, meta, fullp in cars_pool:
+        v, r, mip = _pearson_best_v(fullp, mask_image)
+        if r > best_tuple[0]:
+            best_tuple = (r, v, fullp, mip)
+    best_r, best_v, cars_nd2_path, cars_mip_best = best_tuple
+    
+    if cars_nd2_path is None:
+        raise RuntimeError(f"No valid CARS candidate produced an alignment score for '{folder_base}'.")
 
-        for v_idx in range(total_v):
-            mip_slices = []
-            for z in range(cars_nd2.sizes.get("z", 1)):
-                raw_sl = np.nan_to_num(cars_nd2.get_frame_2D(v=v_idx, c=CARS_CH, z=z)).astype(np.float32)
-                filtered = apply_east_shadows_filter(raw_sl)
-                den = np.clip(reference_image, 1e-6, None)
-                corrected = filtered / den
-                if foci_params.get("sigma", 0) > 0:
-                    corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
-                mip_slices.append(corrected)
-            C = np.max(np.stack(mip_slices, axis=0), axis=0)
+    logger.info("[HYPERMAP] Folder=%s, best CARS='%s', v=%s, r=%.3f", folder_base, os.path.basename(cars_nd2_path), str(best_v), best_r)
 
-            Cm, Cs = C.mean(), C.std()
-            r = -np.inf if (Hs == 0 or Cs == 0) else float(((H - Hm) * (C - Cm)).sum() / (Hs * Cs * H.size))
-            if r > best_r:
-                best_r, best_v = r, v_idx
+    # Choose the fluorescence ND2 whose prefix matches the chosen CARS prefix.
+    # If multiple (e.g., MAP2 vs TUJ), keep the one whose name contains the resolved marker
+    # for this hyperspectral folder; otherwise fall back to any with matching prefix.
+    chosen_cars_meta = parse_nd2_filename(os.path.basename(cars_nd2_path), config)
+    cars_prefix = chosen_cars_meta["prefix"]
+
+    # Prefer exact prefix match; then prefer names containing the resolved marker (MAP2/TUJ)
+    preferred = []
+    fallback  = []
+    marker_token = cell_marker  # already resolved via resolve_marker_name in infer_hyperspectral_mapping
+    for fname, meta, fullp in fluor_pool:
+        if meta["prefix"] == cars_prefix:
+            (preferred if (marker_token and marker_token in fname) else fallback).append((fname, meta, fullp))
+
+    if preferred:
+        fluor_nd2_path = preferred[0][2]
+    elif fallback:
+        fluor_nd2_path = fallback[0][2]
+    else:
+        # Absolute fallback: use the one from mapping (original behavior)
+        fluor_nd2_path = os.path.join(data_dir, mapping["fluor_nd2"])
+
+    cars_img_for_overlay = mask_image  # keep the same overlay reference
 
     logger.info("[HYPERMAP] Folder=%s, best v=%s, r=%.3f", folder_base, str(best_v), best_r)
     if best_v is None:  # safety fallback
         best_v = 0
-    cars_img_for_overlay = mask_image
 
     # --- Build cell/auto/LAMP2 masks from fluorescence ND2 ---
     with ND2Reader(fluor_nd2_path) as fl_nd2:
@@ -1072,7 +1172,11 @@ def process_hyperspectral_series(
     ratio_norm = (ratio_map - ratio_min) / (ratio_max - ratio_min + 1e-9)
     ratio_norm_clipped = np.clip(ratio_norm, 0.0, 1.0)
 
-    cmap = LinearSegmentedColormap.from_list("yellow_red", [(1.0, 1.0, 0.0), (1.0, 0.0, 0.0)])
+    cmap = LinearSegmentedColormap.from_list(
+        "red_white_yellow",
+        [(1.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 0.0)],  # red -> white -> yellow
+        N=256
+    )
     ratio_rgba = cmap(ratio_norm_clipped)
     ratio_rgb = (ratio_rgba[..., :3] * 255).astype(np.uint8)
 
