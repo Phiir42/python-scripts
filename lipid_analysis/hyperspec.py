@@ -259,15 +259,21 @@ def _save_labeled_mask_images(
     # --- optional: 2-channel TIFF for FIJI (Ch 0 = CARS, Ch 1 = labels) ---
     try:
         import tifffile as tiff
-        cars16 = (base / bmax * 65535.0).astype(np.uint16)          # full-range 16-bit CARS
-        labels16 = labeled_mask.astype(np.uint16)                   # label IDs (0=background)
-        # Stack as (channels, height, width) so FIJI sees 2 channels
+        cars16   = (base / bmax * 65535.0).astype(np.uint16)   # (H, W)
+        labels16 = labeled_mask.astype(np.uint16)              # (H, W)
+    
+        stack_cyx = np.ascontiguousarray(np.stack([cars16, labels16], axis=0))  # (2, H, W)
+    
         tiff_path = os.path.join(out_dir, "Hyperspec_CARS_and_Labels.tif")
         tiff.imwrite(
             tiff_path,
-            np.stack([cars16, labels16], axis=-1),
+            stack_cyx,
+            imagej=True,                     # <- key for FIJI hyperstack
             photometric="minisblack",
-            metadata={"axes": "YXC"}  # Channels, Y, X
+            metadata={
+                "axes": "CYX",
+                "channel_names": ["CARS", "Labels"],
+            },
         )
     except Exception as _exc:
         logger.info("TIFF (2-channel) write skipped: %s", _exc)
@@ -1183,14 +1189,28 @@ def process_hyperspectral_series(
     bg_mask = ratio_map < 0
     ratio_rgb[bg_mask] = [0, 0, 0]
 
+    # --- Ratio heatmap visualization with colorbar legend ---
     plt.figure(figsize=(6, 6))
-    plt.imshow(ratio_rgb)
-    plt.title("Droplet Ratio Map (2930 / 2850)")
+    im = plt.imshow(ratio_norm_clipped, cmap=cmap, vmin=0, vmax=1)
+    plt.title("Droplet Ratio Map (2930 / 2850) — red→white→yellow", fontsize=12)
     plt.axis("off")
-    plt.show()
+
+    # --- add legend / colorbar ---
+    cbar = plt.colorbar(im, fraction=0.046, pad=0.04)
+    cbar.set_label("2930 / 2850 CH Stretch Ratio", rotation=270, labelpad=15)
+    cbar.ax.tick_params(labelsize=8, width=0.5)
+    # optional: tick labels converted back to physical ratio values
+    tick_vals = np.linspace(0, 1, 6)
+    cbar.set_ticks(tick_vals)
+    cbar.set_ticklabels([f"{ratio_min + t*(ratio_max - ratio_min):.2f}" for t in tick_vals])
+
+    plt.tight_layout()
+    out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850_withLegend.png")
+    plt.savefig(out_path_ratio, dpi=300, bbox_inches="tight")
     plt.close()
 
+    # Also save the RGB heatmap version for reference (no colorbar)
     ratio_bgr = cv2.cvtColor(ratio_rgb, cv2.COLOR_RGB2BGR)
-    out_path_ratio = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
-    cv2.imwrite(out_path_ratio, ratio_bgr)
-    logger.info("Ratio heatmap saved to %s", out_path_ratio)
+    out_path_ratio_plain = os.path.join(spectrum_folder, "Ratio_2930_over_2850.png")
+    cv2.imwrite(out_path_ratio_plain, ratio_bgr)
+    logger.info("Ratio heatmaps saved to %s and %s", out_path_ratio, out_path_ratio_plain)
