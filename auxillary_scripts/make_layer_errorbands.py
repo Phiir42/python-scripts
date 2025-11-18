@@ -58,13 +58,13 @@ YLABELS: Dict[str, str] = {
 
 # Per-category axis ranges and tick steps (adjust as needed)
 YLIMS: Dict[str, Tuple[float, float]] = {
-    "Lipids": (0.0, 3.0),
-    "Lipidated Lipofuscin": (0.0, 6.0),
+    "Lipids": (0.0, 1.0),
+    "Lipidated Lipofuscin": (0.0, 2.0),
     "Lipofuscin": (0.0, 10.0),
 }
 YTICK_STEP: Dict[str, float] = {
-    "Lipids": 1.0,
-    "Lipidated Lipofuscin": 1.0,
+    "Lipids": 0.2,
+    "Lipidated Lipofuscin": 0.4,
     "Lipofuscin": 2.0,
 }
 
