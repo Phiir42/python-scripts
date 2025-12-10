@@ -753,6 +753,9 @@ def process_hyperspectral_series(
     assert config is not None, "Global 'config' must be set before calling process_hyperspectral_series()."
 
     folder_base = os.path.basename(spectrum_folder)
+    
+    # If True, skip all fluorescence/cell-marker logic and run cell-agnostic.
+    cell_agnostic = bool(config.get("hyperspec_params", {}).get("cell_agnostic", False))
 
     # Peak-fit debug capture (PNG + multi-page PDF, optional PPTX)
     debug_root = os.path.join(config["paths"]["data_directory"], config.get("debug_output_dir", "Debug"))
@@ -774,9 +777,14 @@ def process_hyperspectral_series(
         logger.info("[HYPERMAP] Inferred mapping: %s", mapping)
     else:
         logger.info("[HYPERMAP] Using config mapping: %s", mapping)
-
+    
     data_dir = config["paths"]["data_directory"]
-    cell_marker = mapping["cell_marker"]
+    
+    # Only require cell_marker if we are NOT in cell-agnostic mode.
+    if cell_agnostic:
+        cell_marker = ""
+    else:
+        cell_marker = mapping["cell_marker"]
 
     # ---- NEW: Build candidate pools (handles AD4b having two StacksNeurons) ----
     from .filepairing import parse_nd2_filename
@@ -800,8 +808,11 @@ def process_hyperspectral_series(
 
     if not cars_pool:
         raise FileNotFoundError(f"No CARS candidates found for stacks '{target_stacks_label}' in {data_dir}")
-    if not fluor_pool:
-        raise FileNotFoundError(f"No fluorescence candidates found for stacks '{target_stacks_label}' in {data_dir}")
+    if not fluor_pool and not cell_agnostic:
+        raise FileNotFoundError(
+            f"No fluorescence candidates found for stacks '{target_stacks_label}' in {data_dir}"
+        )
+
 
     # --- Load and correct the 32-image hyperspectral series ---
     def _num_key(p: str) -> int | str:
@@ -892,98 +903,106 @@ def process_hyperspectral_series(
     if best_v is None:  # safety fallback
         best_v = 0
 
-    # --- Build cell/auto/LAMP2 masks from fluorescence ND2 ---
-    with ND2Reader(fluor_nd2_path) as fl_nd2:
-        ch_idx = config["channel_map"][cell_marker]
-        fluoro_mip = max_project_fluorescence(
-            fl_nd2,
-            ch_index=ch_idx,
-            position=best_v,
-            fluoro_params=config["morphology_params"]["fluorescence_params"],
-        )
-
-        # DEBUG: save alignment triptych (Hyperspec 2850, matched Fluor z, matched CARS z)
-        try:
-            if config.get("debug_alignment", False) or VERBOSE:
-                with ND2Reader(cars_nd2_path) as cars_nd2_dbg:
-                    mip_slices_dbg = []
-                    for z in range(cars_nd2_dbg.sizes.get("z", 1)):
-                        raw_sl = np.nan_to_num(cars_nd2_dbg.get_frame_2D(v=best_v, c=CARS_CH, z=z)).astype(np.float32)
-                        filtered = apply_east_shadows_filter(raw_sl)
-                        den = np.clip(reference_image, 1e-6, None)
-                        corrected = filtered / den
-                        if foci_params.get("sigma", 0) > 0:
-                            corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
-                        mip_slices_dbg.append(corrected)
-                    cars_mip_best = np.max(np.stack(mip_slices_dbg, axis=0), axis=0)
-
-                out_dir = os.path.join(config["paths"]["data_directory"], config.get("debug_output_dir", "Debug"))
-                out_png = os.path.join(out_dir, f"align_{folder_base}_z{best_v}_r{best_r:.3f}.png")
-                save_alignment_triptych(
-                    out_png,
-                    mask_image,
-                    fluoro_mip,
-                    cars_mip_best,
-                    label=folder_base,
-                    chosen_z=best_v,
-                    corr_value=best_r,
-                    show=config.get("debug_alignment_show_plots", False),
-                )
-        except Exception as exc:
-            if VERBOSE:
-                logger.info("[DEBUG] alignment triptych failed: %s", exc)
-
-        auto_ch = config["channel_map"].get("Autofluorescence")
-        if auto_ch is not None:
-            with ND2Reader(fluor_nd2_path) as fl_nd22:
-                auto_mip = max_project_fluorescence(
-                    fl_nd22,
-                    ch_index=auto_ch,
-                    position=best_v,
-                    fluoro_params=config["morphology_params"]["autofluorescence_params"],
-                )
-            auto_mask = find_foci(auto_mip, **config["morphology_params"]["autofluorescence_params"], debug=VERBOSE)
-        else:
-            auto_mip = None
-            auto_mask = np.zeros_like(mask_image, dtype=bool)
-
-        lamp2_mask = None
-        lamp2_ch = config["channel_map"].get("LAMP2")
-        if lamp2_ch is not None:
-            with ND2Reader(fluor_nd2_path) as fl_nd22:
-                lamp2_mip = max_project_fluorescence(
-                    fl_nd22,
-                    ch_index=lamp2_ch,
-                    position=best_v,
-                    fluoro_params=config["morphology_params"]["fluorescence_params"],
-                )
-            lamp2_params = config["morphology_params"].get(
-                "lamp2_params", config["morphology_params"]["autofluorescence_params"]
+    if not cell_agnostic:
+        # --- Build cell/auto/LAMP2 masks from fluorescence ND2 ---
+        with ND2Reader(fluor_nd2_path) as fl_nd2:
+            ch_idx = config["channel_map"][cell_marker]
+            fluoro_mip = max_project_fluorescence(
+                fl_nd2,
+                ch_index=ch_idx,
+                position=best_v,
+                fluoro_params=config["morphology_params"]["fluorescence_params"],
             )
-            lamp2_mask = find_foci(lamp2_mip, **lamp2_params, debug=VERBOSE)
-            lamp2_mask = dilation(lamp2_mask, disk(1))
-        lamp2_available = lamp2_mask is not None
-
-    # --- Cell mask thresholding with per-marker overrides ---
-    fluorescence_params = config["morphology_params"]["fluorescence_params"]
-    marker_thresholds = config.get("marker_thresholds", {}).get(cell_marker, {})
-    threshold_method = marker_thresholds.get("threshold_method", fluorescence_params.get("threshold_method", "otsu"))
-    offset_val = marker_thresholds.get("offset", fluorescence_params.get("offset", 1.0))
-
-    cell_mask = process_fluorescence_channel(
-        fluoro_mip,
-        cell_size=fluorescence_params["cell_size"],
-        min_size=fluorescence_params["min_size"],
-        closing_radius=fluorescence_params["closing_radius"],
-        gaussian_sigma=fluorescence_params["gaussian_sigma"],
-        fill_holes=fluorescence_params["fill_holes"],
-        threshold_method=threshold_method,
-        offset=offset_val,
-        exclude_dark_regions=fluorescence_params.get("exclude_dark_regions", True),
-        dark_threshold=fluorescence_params.get("dark_threshold", 50),
-        min_hole_size=fluorescence_params.get("min_hole_size", 20000),
-        debug=False,
-    )
+    
+            # DEBUG: save alignment triptych (Hyperspec 2850, matched Fluor z, matched CARS z)
+            try:
+                if config.get("debug_alignment", False) or VERBOSE:
+                    with ND2Reader(cars_nd2_path) as cars_nd2_dbg:
+                        mip_slices_dbg = []
+                        for z in range(cars_nd2_dbg.sizes.get("z", 1)):
+                            raw_sl = np.nan_to_num(cars_nd2_dbg.get_frame_2D(v=best_v, c=CARS_CH, z=z)).astype(np.float32)
+                            filtered = apply_east_shadows_filter(raw_sl)
+                            den = np.clip(reference_image, 1e-6, None)
+                            corrected = filtered / den
+                            if foci_params.get("sigma", 0) > 0:
+                                corrected = gaussian(corrected, sigma=foci_params["sigma"], preserve_range=True)
+                            mip_slices_dbg.append(corrected)
+                        cars_mip_best = np.max(np.stack(mip_slices_dbg, axis=0), axis=0)
+    
+                    out_dir = os.path.join(config["paths"]["data_directory"], config.get("debug_output_dir", "Debug"))
+                    out_png = os.path.join(out_dir, f"align_{folder_base}_z{best_v}_r{best_r:.3f}.png")
+                    save_alignment_triptych(
+                        out_png,
+                        mask_image,
+                        fluoro_mip,
+                        cars_mip_best,
+                        label=folder_base,
+                        chosen_z=best_v,
+                        corr_value=best_r,
+                        show=config.get("debug_alignment_show_plots", False),
+                    )
+            except Exception as exc:
+                if VERBOSE:
+                    logger.info("[DEBUG] alignment triptych failed: %s", exc)
+    
+            auto_ch = config["channel_map"].get("Autofluorescence")
+            if auto_ch is not None:
+                with ND2Reader(fluor_nd2_path) as fl_nd22:
+                    auto_mip = max_project_fluorescence(
+                        fl_nd22,
+                        ch_index=auto_ch,
+                        position=best_v,
+                        fluoro_params=config["morphology_params"]["autofluorescence_params"],
+                    )
+                auto_mask = find_foci(auto_mip, **config["morphology_params"]["autofluorescence_params"], debug=VERBOSE)
+            else:
+                auto_mip = None
+                auto_mask = np.zeros_like(mask_image, dtype=bool)
+    
+            lamp2_mask = None
+            lamp2_ch = config["channel_map"].get("LAMP2")
+            if lamp2_ch is not None:
+                with ND2Reader(fluor_nd2_path) as fl_nd22:
+                    lamp2_mip = max_project_fluorescence(
+                        fl_nd22,
+                        ch_index=lamp2_ch,
+                        position=best_v,
+                        fluoro_params=config["morphology_params"]["fluorescence_params"],
+                    )
+                lamp2_params = config["morphology_params"].get(
+                    "lamp2_params", config["morphology_params"]["autofluorescence_params"]
+                )
+                lamp2_mask = find_foci(lamp2_mip, **lamp2_params, debug=VERBOSE)
+                lamp2_mask = dilation(lamp2_mask, disk(1))
+            lamp2_available = lamp2_mask is not None
+    
+        # --- Cell mask thresholding with per-marker overrides ---
+        fluorescence_params = config["morphology_params"]["fluorescence_params"]
+        marker_thresholds = config.get("marker_thresholds", {}).get(cell_marker, {})
+        threshold_method = marker_thresholds.get("threshold_method", fluorescence_params.get("threshold_method", "otsu"))
+        offset_val = marker_thresholds.get("offset", fluorescence_params.get("offset", 1.0))
+    
+        cell_mask = process_fluorescence_channel(
+            fluoro_mip,
+            cell_size=fluorescence_params["cell_size"],
+            min_size=fluorescence_params["min_size"],
+            closing_radius=fluorescence_params["closing_radius"],
+            gaussian_sigma=fluorescence_params["gaussian_sigma"],
+            fill_holes=fluorescence_params["fill_holes"],
+            threshold_method=threshold_method,
+            offset=offset_val,
+            exclude_dark_regions=fluorescence_params.get("exclude_dark_regions", True),
+            dark_threshold=fluorescence_params.get("dark_threshold", 50),
+            min_hole_size=fluorescence_params.get("min_hole_size", 20000),
+            debug=False,
+        )
+    else:
+        # Cell-agnostic branch: no fluorescence, no AF, no LAMP2, no cell mask.
+        auto_mip = None
+        auto_mask = np.zeros_like(mask_image, dtype=bool)
+        lamp2_mask = None
+        lamp2_available = False
+        cell_mask = np.zeros_like(mask_image, dtype=bool)
 
     # --- Droplet masks and overlays ---
     cars_foci_mask = find_foci(mask_image, **foci_params)
@@ -1010,16 +1029,17 @@ def process_hyperspectral_series(
     intracellular_pure_lipofuscin   = pure_lipofuscin_mask & cell_mask
 
     if VERBOSE:
-        debug_display_3way_segmentation(
-            intracellular_pure_lipid,
-            intracellular_lipid_lipofuscin,
-            intracellular_pure_lipofuscin,
-            cell_mask,
-            auto_image=auto_mip,
-            cars_image=cars_img_for_overlay,
-            pos_index=best_v,
-            title_suffix=f"[{cell_marker}]",
-        )
+        if not cell_agnostic:
+            debug_display_3way_segmentation(
+                intracellular_pure_lipid,
+                intracellular_lipid_lipofuscin,
+                intracellular_pure_lipofuscin,
+                cell_mask,
+                auto_image=auto_mip,
+                cars_image=cars_img_for_overlay,
+                pos_index=best_v,
+                title_suffix=f"[{cell_marker}]",
+            )
         visualize_hyperspectral_mask_overlay(mask_image, lipid_mask)
 
     # --- Per-droplet intensity table ---
