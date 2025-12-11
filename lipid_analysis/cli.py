@@ -164,7 +164,7 @@ def main() -> None:
     # 1) Reference
     logger.info("Generating reference image from %s", reference_file)
     reference_image = generate_reference_image(
-        reference_file, reference_output_path, blur_radius_microns=2
+        reference_file, reference_output_path, blur_radius_microns=2, target_shape=(2970,2970), overlap=0.05
     )
     logger.info("Saved reference image to %s", reference_output_path)
 

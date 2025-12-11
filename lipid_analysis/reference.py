@@ -33,10 +33,74 @@ def _get_pixel_size_microns(nd2: ND2Reader) -> float:
     return px
 
 
+def tile_with_overlap(base: np.ndarray, target_shape: tuple[int, int], overlap: float = 0.05) -> np.ndarray:
+    """
+    Tile a smaller 2D image `base` into a larger `target_shape` with fractional overlap.
+    Overlap creates a smooth blending between tiles using linear weighting.
+
+    Parameters
+    ----------
+    base : 2D array
+        The reference image to tile.
+    target_shape : (H, W)
+        Desired output size.
+    overlap : float
+        Fraction of tile size to overlap in each direction (0.05 = 5%).
+
+    Returns
+    -------
+    tiled : 2D array
+        New image of size `target_shape`.
+    """
+    bh, bw = base.shape
+    th, tw = target_shape
+
+    # compute stride with overlap
+    stride_y = int(bh * (1 - overlap))
+    stride_x = int(bw * (1 - overlap))
+
+    # number of tiles needed
+    ny = max(1, int(np.ceil((th - bh) / stride_y)) + 1)
+    nx = max(1, int(np.ceil((tw - bw) / stride_x)) + 1)
+
+    # prepare accumulator and weight map
+    acc = np.zeros((th, tw), dtype=np.float32)
+    wgt = np.zeros((th, tw), dtype=np.float32)
+
+    # smooth blending mask
+    yy = np.linspace(0, 1, bh)
+    xx = np.linspace(0, 1, bw)
+    wy = 1 - np.abs(yy - 0.5) * 2  # triangle windows for smooth edges
+    wx = 1 - np.abs(xx - 0.5) * 2
+    blend = np.outer(wy, wx).astype(np.float32)
+
+    # tile placement
+    for iy in range(ny):
+        for ix in range(nx):
+            y0 = iy * stride_y
+            x0 = ix * stride_x
+            y1 = min(y0 + bh, th)
+            x1 = min(x0 + bw, tw)
+
+            # compute cropping if the tile spills outside
+            tile = base[: y1 - y0, : x1 - x0]
+            bmask = blend[: y1 - y0, : x1 - x0]
+
+            acc[y0:y1, x0:x1] += tile * bmask
+            wgt[y0:y1, x0:x1] += bmask
+
+    # Normalize blended region
+    wgt = np.clip(wgt, 1e-6, None)
+    return acc / wgt
+
+
+
 def generate_reference_image(
     reference_file: str,
     output_path: str,
     blur_radius_microns: float,
+    target_shape: tuple[int, int] | None = None,
+    overlap: float = 0.05,
 ) -> np.ndarray:
     """
     Generate a normalized reference image from an ND2 file's CARS channel.
@@ -101,6 +165,19 @@ def generate_reference_image(
     if max_val <= 0:
         raise ValueError("Processed reference image has no positive values to normalize.")
     normalized = (blurred / max_val).astype(np.float32, copy=False)
+    # If target_shape is given AND the reference is smaller → tile with overlap
+    if target_shape is not None:
+        ref_h, ref_w = normalized.shape
+        tgt_h, tgt_w = target_shape
+    
+        if tgt_h > ref_h or tgt_w > ref_w:
+            logger.info(
+                "Reference image smaller than target; tiling with %.1f%% overlap to match %s",
+                overlap * 100,
+                target_shape,
+            )
+            normalized = tile_with_overlap(normalized, target_shape, overlap)
+
 
     # Ensure output directory exists
     out_dir = os.path.dirname(os.path.abspath(output_path))
